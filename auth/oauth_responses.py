@@ -26,7 +26,8 @@ def create_error_response(error_message: str, status_code: int = 400) -> HTMLRes
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Error</h2>
             <p>{error_message}</p>
-            <p>Please ensure you grant the requested permissions. You can close this tab and try again.</p>
+            <p>Please ensure you grant the requested permissions. You can close this window and try again.</p>
+            <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
         </body>
         </html>
     """
@@ -175,17 +176,9 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
         }}
     </style>
     <script>
-        function tryClose() {{
+        setTimeout(function() {{
             window.close();
-            // If window.close() was blocked by the browser, update the UI
-            setTimeout(function() {{
-                var btn = document.querySelector('.button');
-                if (btn) btn.textContent = 'You can close this tab manually';
-                var ac = document.querySelector('.auto-close');
-                if (ac) ac.style.display = 'none';
-            }}, 500);
-        }}
-        setTimeout(tryClose, 10000);
+        }}, 10000);
     </script>
 </head>
 <body>
@@ -196,10 +189,10 @@ def create_success_response(verified_user_id: Optional[str] = None) -> HTMLRespo
             You've been authenticated as <span class="user-id">{user_display}</span>
         </div>
         <div class="message">
-            Your credentials have been securely saved. You can now close this tab and retry your original command.
+            Your credentials have been securely saved. You can now close this window and retry your original command.
         </div>
-        <button class="button" onclick="tryClose()">Close Tab</button>
-        <div class="auto-close">This tab will close automatically in 10 seconds</div>
+        <button class="button" onclick="window.close()">Close Window</button>
+        <div class="auto-close">This window will close automatically in 10 seconds</div>
     </div>
 </body>
 </html>"""
@@ -222,7 +215,8 @@ def create_server_error_response(error_detail: str) -> HTMLResponse:
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; text-align: center;">
             <h2 style="color: #d32f2f;">Authentication Processing Error</h2>
             <p>An unexpected error occurred while processing your authentication: {error_detail}</p>
-            <p>Please try again. You can close this tab.</p>
+            <p>Please try again. You can close this window.</p>
+            <script>setTimeout(function() {{ window.close(); }}, 10000);</script>
         </body>
         </html>
     """

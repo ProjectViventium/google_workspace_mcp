@@ -15,7 +15,7 @@ from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from auth.scopes import SCOPES, get_current_scopes, has_required_scopes  # noqa
+from auth.scopes import SCOPES, get_current_scopes # noqa
 from auth.oauth21_session_store import get_oauth21_session_store
 from auth.credential_store import get_credential_store
 from auth.oauth_config import get_oauth_config, is_stateless_mode
@@ -38,30 +38,10 @@ logger = logging.getLogger(__name__)
 
 # Constants
 def get_default_credentials_dir():
-    """Get the default credentials directory path, preferring user-specific locations.
-
-    Environment variable priority:
-    1. WORKSPACE_MCP_CREDENTIALS_DIR (preferred)
-    2. GOOGLE_MCP_CREDENTIALS_DIR (backward compatibility)
-    3. ~/.google_workspace_mcp/credentials (default)
-    """
-    # Check WORKSPACE_MCP_CREDENTIALS_DIR first (preferred)
-    workspace_creds_dir = os.getenv("WORKSPACE_MCP_CREDENTIALS_DIR")
-    if workspace_creds_dir:
-        expanded = os.path.expanduser(workspace_creds_dir)
-        logger.info(
-            f"Using credentials directory from WORKSPACE_MCP_CREDENTIALS_DIR: {expanded}"
-        )
-        return expanded
-
-    # Fall back to GOOGLE_MCP_CREDENTIALS_DIR for backward compatibility
-    google_creds_dir = os.getenv("GOOGLE_MCP_CREDENTIALS_DIR")
-    if google_creds_dir:
-        expanded = os.path.expanduser(google_creds_dir)
-        logger.info(
-            f"Using credentials directory from GOOGLE_MCP_CREDENTIALS_DIR: {expanded}"
-        )
-        return expanded
+    """Get the default credentials directory path, preferring user-specific locations."""
+    # Check for explicit environment variable override
+    if os.getenv("GOOGLE_MCP_CREDENTIALS_DIR"):
+        return os.getenv("GOOGLE_MCP_CREDENTIALS_DIR")
 
     # Use user home directory for credentials storage
     home_dir = os.path.expanduser("~")
@@ -93,14 +73,13 @@ else:
 
 def _find_any_credentials(
     base_dir: str = DEFAULT_CREDENTIALS_DIR,
-) -> tuple[Optional[Credentials], Optional[str]]:
+) -> Optional[Credentials]:
     """
     Find and load any valid credentials from the credentials directory.
     Used in single-user mode to bypass session-to-OAuth mapping.
 
     Returns:
-        Tuple of (Credentials, user_email) or (None, None) if none exist.
-        Returns the user email to enable saving refreshed credentials.
+        First valid Credentials object found, or None if none exist.
     """
     try:
         store = get_credential_store()
@@ -109,7 +88,7 @@ def _find_any_credentials(
             logger.info(
                 "[single-user] No users found with credentials via credential store"
             )
-            return None, None
+            return None
 
         # Return credentials for the first user found
         first_user = users[0]
@@ -118,7 +97,7 @@ def _find_any_credentials(
             logger.info(
                 f"[single-user] Found credentials for {first_user} via credential store"
             )
-            return credentials, first_user
+            return credentials
         else:
             logger.warning(
                 f"[single-user] Could not load credentials for {first_user} via credential store"
@@ -130,7 +109,7 @@ def _find_any_credentials(
         )
 
     logger.info("[single-user] No valid credentials found via credential store")
-    return None, None
+    return None
 
 
 def save_credentials_to_session(session_id: str, credentials: Credentials):
@@ -157,15 +136,11 @@ def save_credentials_to_session(session_id: str, credentials: Credentials):
             client_secret=credentials.client_secret,
             scopes=credentials.scopes,
             expiry=credentials.expiry,
-            mcp_session_id=session_id,
+            mcp_session_id=session_id
         )
-        logger.debug(
-            f"Credentials saved to OAuth21SessionStore for session_id: {session_id}, user: {user_email}"
-        )
+        logger.debug(f"Credentials saved to OAuth21SessionStore for session_id: {session_id}, user: {user_email}")
     else:
-        logger.warning(
-            f"Could not save credentials to session store - no user email found for session: {session_id}"
-        )
+        logger.warning(f"Could not save credentials to session store - no user email found for session: {session_id}")
 
 
 def load_credentials_from_session(session_id: str) -> Optional[Credentials]:
@@ -291,34 +266,16 @@ def check_client_secrets() -> Optional[str]:
 
 
 def create_oauth_flow(
-    scopes: List[str],
-    redirect_uri: str,
-    state: Optional[str] = None,
-    code_verifier: Optional[str] = None,
-    autogenerate_code_verifier: bool = True,
+    scopes: List[str], redirect_uri: str, state: Optional[str] = None
 ) -> Flow:
     """Creates an OAuth flow using environment variables or client secrets file."""
-    flow_kwargs = {
-        "scopes": scopes,
-        "redirect_uri": redirect_uri,
-        "state": state,
-    }
-    if code_verifier:
-        flow_kwargs["code_verifier"] = code_verifier
-        # Preserve the original verifier when re-creating the flow in callback.
-        flow_kwargs["autogenerate_code_verifier"] = False
-    else:
-        # Generate PKCE code verifier for the initial auth flow.
-        # google-auth-oauthlib's from_client_* helpers pass
-        # autogenerate_code_verifier=None unless explicitly provided, which
-        # prevents Flow from generating and storing a code_verifier.
-        flow_kwargs["autogenerate_code_verifier"] = autogenerate_code_verifier
-
     # Try environment variables first
     env_config = load_client_secrets_from_env()
     if env_config:
         # Use client config directly
-        flow = Flow.from_client_config(env_config, **flow_kwargs)
+        flow = Flow.from_client_config(
+            env_config, scopes=scopes, redirect_uri=redirect_uri, state=state
+        )
         logger.debug("Created OAuth flow from environment variables")
         return flow
 
@@ -330,109 +287,14 @@ def create_oauth_flow(
 
     flow = Flow.from_client_secrets_file(
         CONFIG_CLIENT_SECRETS_PATH,
-        **flow_kwargs,
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        state=state,
     )
     logger.debug(
         f"Created OAuth flow from client secrets file: {CONFIG_CLIENT_SECRETS_PATH}"
     )
     return flow
-
-
-def _determine_oauth_prompt(
-    user_google_email: Optional[str],
-    required_scopes: List[str],
-    session_id: Optional[str] = None,
-) -> str:
-    """
-    Determine which OAuth prompt to use for a new authorization URL.
-
-    Uses `select_account` for re-auth when existing credentials already cover
-    required scopes. Uses `consent` for first-time auth and scope expansion.
-    """
-    normalized_email = (
-        user_google_email.strip()
-        if user_google_email
-        and user_google_email.strip()
-        and user_google_email.lower() != "default"
-        else None
-    )
-
-    # If no explicit email was provided, attempt to resolve it from session mapping.
-    if not normalized_email and session_id:
-        try:
-            session_user = get_oauth21_session_store().get_user_by_mcp_session(
-                session_id
-            )
-            if session_user:
-                normalized_email = session_user
-        except Exception as e:
-            logger.debug(f"Could not resolve user from session for prompt choice: {e}")
-
-    if not normalized_email:
-        logger.info(
-            "[start_auth_flow] Using prompt='consent' (no known user email for re-auth detection)."
-        )
-        return "consent"
-
-    existing_credentials: Optional[Credentials] = None
-
-    # Prefer credentials bound to the current session when available.
-    if session_id:
-        try:
-            session_store = get_oauth21_session_store()
-            mapped_user = session_store.get_user_by_mcp_session(session_id)
-            if mapped_user == normalized_email:
-                existing_credentials = session_store.get_credentials_by_mcp_session(
-                    session_id
-                )
-        except Exception as e:
-            logger.debug(
-                f"Could not read OAuth 2.1 session store for prompt choice: {e}"
-            )
-
-    # Fall back to credential file store in stateful mode.
-    if not existing_credentials and not is_stateless_mode():
-        try:
-            existing_credentials = get_credential_store().get_credential(
-                normalized_email
-            )
-        except Exception as e:
-            logger.debug(f"Could not read credential store for prompt choice: {e}")
-
-    if not existing_credentials:
-        logger.info(
-            f"[start_auth_flow] Using prompt='consent' (no existing credentials for {normalized_email})."
-        )
-        return "consent"
-
-    if has_required_scopes(existing_credentials.scopes, required_scopes):
-        # Verify the credentials can still be refreshed before using select_account.
-        # When credentials are revoked, Google's select_account prompt may produce
-        # incomplete callbacks (missing state parameter, partial scopes).
-        if existing_credentials.valid:
-            logger.info(
-                f"[start_auth_flow] Using prompt='select_account' for re-auth of {normalized_email}."
-            )
-            return "select_account"
-        if existing_credentials.refresh_token:
-            try:
-                existing_credentials.refresh(Request())
-                logger.info(
-                    f"[start_auth_flow] Using prompt='select_account' for re-auth of {normalized_email}."
-                )
-                return "select_account"
-            except Exception:
-                logger.info(
-                    f"[start_auth_flow] Credentials for {normalized_email} cannot be refreshed; "
-                    "using prompt='consent' to ensure full re-authorization."
-                )
-                return "consent"
-
-    logger.info(
-        f"[start_auth_flow] Using prompt='consent' (existing credentials for {normalized_email} "
-        "are not refreshable or are missing required scopes)."
-    )
-    return "consent"
 
 
 # --- Core OAuth Logic ---
@@ -484,38 +346,26 @@ async def start_auth_flow(
             os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
         oauth_state = os.urandom(16).hex()
-        current_scopes = get_current_scopes()
 
         flow = create_oauth_flow(
-            scopes=current_scopes,  # Use scopes for enabled tools only
+            scopes=get_current_scopes(),  # Use scopes for enabled tools only
             redirect_uri=redirect_uri,  # Use passed redirect_uri
             state=oauth_state,
         )
+
+        auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
 
         session_id = None
         try:
             session_id = get_fastmcp_session_id()
         except Exception as e:
-            logger.debug(
-                f"Could not retrieve FastMCP session ID for state binding: {e}"
-            )
-
-        prompt_type = _determine_oauth_prompt(
-            user_google_email=user_google_email,
-            required_scopes=current_scopes,
-            session_id=session_id,
-        )
-        auth_url, _ = flow.authorization_url(access_type="offline", prompt=prompt_type)
+            logger.debug(f"Could not retrieve FastMCP session ID for state binding: {e}")
 
         store = get_oauth21_session_store()
-        store.store_oauth_state(
-            oauth_state,
-            session_id=session_id,
-            code_verifier=flow.code_verifier,
-        )
+        store.store_oauth_state(oauth_state, session_id=session_id)
 
         logger.info(
-            f"Auth flow started for {user_display_name}. Advise user to visit: {auth_url}"
+            f"Auth flow started for {user_display_name}. State: {oauth_state[:8]}... Advise user to visit: {auth_url}"
         )
 
         message_lines = [
@@ -605,48 +455,20 @@ def handle_auth_callback(
             )
             os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-        # Allow partial scope grants without raising an exception.
-        # When users decline some scopes on Google's consent screen,
-        # oauthlib raises because the granted scopes differ from requested.
-        if "OAUTHLIB_RELAX_TOKEN_SCOPE" not in os.environ:
-            os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
-
         store = get_oauth21_session_store()
         parsed_response = urlparse(authorization_response)
         state_values = parse_qs(parsed_response.query).get("state")
         state = state_values[0] if state_values else None
 
-        if state:
-            state_info = store.validate_and_consume_oauth_state(
-                state, session_id=session_id
-            )
-        elif session_id is None:
-            # stdio mode fallback: state may be absent from Google's redirect
-            # (e.g. when prompt=select_account is used with revoked credentials).
-            # Use the most recently stored state to recover the PKCE code_verifier.
-            logger.warning(
-                "OAuth callback missing state parameter; using most recent stored state (stdio fallback)"
-            )
-            state_info = store.consume_latest_oauth_state()
-            if not state_info:
-                raise ValueError(
-                    "Missing OAuth state parameter and no stored state available"
-                )
-        else:
-            raise ValueError("Missing OAuth state parameter")
-
+        state_info = store.validate_and_consume_oauth_state(state, session_id=session_id)
         logger.debug(
-            "OAuth callback state %s for session %s",
-            (state[:8] if state else "<fallback>"),
+            "Validated OAuth callback state %s for session %s",
+            (state[:8] if state else "<missing>"),
             state_info.get("session_id") or "<unknown>",
         )
 
         flow = create_oauth_flow(
-            scopes=scopes,
-            redirect_uri=redirect_uri,
-            state=state,
-            code_verifier=state_info.get("code_verifier"),
-            autogenerate_code_verifier=False,
+            scopes=scopes, redirect_uri=redirect_uri, state=state
         )
 
         # Exchange the authorization code for credentials
@@ -654,29 +476,6 @@ def handle_auth_callback(
         flow.fetch_token(authorization_response=authorization_response)
         credentials = flow.credentials
         logger.info("Successfully exchanged authorization code for tokens.")
-
-        # Handle partial OAuth grants: if the user declined some scopes on
-        # Google's consent screen, credentials.granted_scopes contains only
-        # what was actually authorized. Store those instead of the inflated
-        # requested scopes so that refresh() sends the correct scope set.
-        granted = getattr(credentials, "granted_scopes", None)
-        if granted and set(granted) != set(credentials.scopes or []):
-            logger.warning(
-                "Partial OAuth grant detected. Requested: %s, Granted: %s",
-                credentials.scopes,
-                granted,
-            )
-            credentials = Credentials(
-                token=credentials.token,
-                refresh_token=credentials.refresh_token,
-                id_token=getattr(credentials, "id_token", None),
-                token_uri=credentials.token_uri,
-                client_id=credentials.client_id,
-                client_secret=credentials.client_secret,
-                scopes=list(granted),
-                expiry=credentials.expiry,
-                quota_project_id=getattr(credentials, "quota_project_id", None),
-            )
 
         # Get user info to determine user_id (using email here)
         user_info = get_user_info(credentials)
@@ -687,61 +486,12 @@ def handle_auth_callback(
         user_google_email = user_info["email"]
         logger.info(f"Identified user_google_email: {user_google_email}")
 
-        credential_store = get_credential_store()
-        if not credentials.refresh_token:
-            fallback_refresh_token = None
-
-            if session_id:
-                try:
-                    session_credentials = store.get_credentials_by_mcp_session(
-                        session_id
-                    )
-                    if session_credentials and session_credentials.refresh_token:
-                        fallback_refresh_token = session_credentials.refresh_token
-                        logger.info(
-                            "OAuth callback response omitted refresh token; preserving existing refresh token from session store."
-                        )
-                except Exception as e:
-                    logger.debug(
-                        f"Could not check session store for existing refresh token: {e}"
-                    )
-
-            if not fallback_refresh_token and not is_stateless_mode():
-                try:
-                    existing_credentials = credential_store.get_credential(
-                        user_google_email
-                    )
-                    if existing_credentials and existing_credentials.refresh_token:
-                        fallback_refresh_token = existing_credentials.refresh_token
-                        logger.info(
-                            "OAuth callback response omitted refresh token; preserving existing refresh token from credential store."
-                        )
-                except Exception as e:
-                    logger.debug(
-                        f"Could not check credential store for existing refresh token: {e}"
-                    )
-
-            if fallback_refresh_token:
-                credentials = Credentials(
-                    token=credentials.token,
-                    refresh_token=fallback_refresh_token,
-                    id_token=getattr(credentials, "id_token", None),
-                    token_uri=credentials.token_uri,
-                    client_id=credentials.client_id,
-                    client_secret=credentials.client_secret,
-                    scopes=credentials.scopes,
-                    expiry=credentials.expiry,
-                    quota_project_id=getattr(credentials, "quota_project_id", None),
-                )
-            else:
-                logger.warning(
-                    "OAuth callback did not include a refresh token and no previous refresh token was available to preserve."
-                )
-
         # Save the credentials
+        credential_store = get_credential_store()
         credential_store.store_credential(user_google_email, credentials)
 
         # Always save to OAuth21SessionStore for centralized management
+        store = get_oauth21_session_store()
         store.store_session(
             user_email=user_google_email,
             access_token=credentials.token,
@@ -752,7 +502,7 @@ def handle_auth_callback(
             scopes=credentials.scopes,
             expiry=credentials.expiry,
             mcp_session_id=session_id,
-            issuer="https://accounts.google.com",  # Add issuer for Google tokens
+            issuer="https://accounts.google.com"  # Add issuer for Google tokens
         )
 
         # If session_id is provided, also save to session cache for compatibility
@@ -781,84 +531,53 @@ def get_credentials(
     Args:
         user_google_email: Optional user's Google email.
         required_scopes: List of scopes the credentials must have.
-        client_secrets_path: Optional path to client secrets (legacy; refresh uses embedded client info).
+        client_secrets_path: Path to client secrets, required for refresh if not in creds.
         credentials_base_dir: Base directory for credential files.
         session_id: Optional MCP session ID.
 
     Returns:
         Valid Credentials object or None.
     """
-    skip_session_cache = False
     # First, try OAuth 2.1 session store if we have a session_id (FastMCP session)
     if session_id:
         try:
             store = get_oauth21_session_store()
 
-            session_user = store.get_user_by_mcp_session(session_id)
-            if user_google_email and session_user and session_user != user_google_email:
-                logger.info(
-                    f"[get_credentials] Session user {session_user} doesn't match requested {user_google_email}; "
-                    "skipping session store"
-                )
-                skip_session_cache = True
-            else:
-                # Try to get credentials by MCP session
-                credentials = store.get_credentials_by_mcp_session(session_id)
-                if credentials:
-                    logger.info(
-                        f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}"
+            # Try to get credentials by MCP session
+            credentials = store.get_credentials_by_mcp_session(session_id)
+            if credentials:
+                logger.info(f"[get_credentials] Found OAuth 2.1 credentials for MCP session {session_id}")
+
+                # Check scopes
+                if not all(scope in credentials.scopes for scope in required_scopes):
+                    logger.warning(
+                        f"[get_credentials] OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}"
                     )
-
-                    # Refresh invalid credentials before checking scopes
-                    if (not credentials.valid) and credentials.refresh_token:
-                        try:
-                            credentials.refresh(Request())
-                            logger.info(
-                                f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}"
-                            )
-                            # Update stored credentials
-                            user_email = store.get_user_by_mcp_session(session_id)
-                            if user_email:
-                                store.store_session(
-                                    user_email=user_email,
-                                    access_token=credentials.token,
-                                    refresh_token=credentials.refresh_token,
-                                    token_uri=credentials.token_uri,
-                                    client_id=credentials.client_id,
-                                    client_secret=credentials.client_secret,
-                                    scopes=credentials.scopes,
-                                    expiry=credentials.expiry,
-                                    mcp_session_id=session_id,
-                                    issuer="https://accounts.google.com",
-                                )
-                                # Persist to file so rotated refresh tokens survive restarts
-                                if not is_stateless_mode():
-                                    try:
-                                        credential_store = get_credential_store()
-                                        credential_store.store_credential(
-                                            user_email, credentials
-                                        )
-                                    except Exception as persist_error:
-                                        logger.warning(
-                                            f"[get_credentials] Failed to persist refreshed OAuth 2.1 credentials for user {user_email}: {persist_error}"
-                                        )
-                        except Exception as e:
-                            logger.error(
-                                f"[get_credentials] Failed to refresh OAuth 2.1 credentials: {e}"
-                            )
-                            return None
-
-                    # Check scopes after refresh so stale metadata doesn't block valid tokens
-                    if not has_required_scopes(credentials.scopes, required_scopes):
-                        logger.warning(
-                            f"[get_credentials] OAuth 2.1 credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}"
-                        )
-                        return None
-
-                    if credentials.valid:
-                        return credentials
-
                     return None
+
+                # Return if valid
+                if credentials.valid:
+                    return credentials
+                elif credentials.expired and credentials.refresh_token:
+                    # Try to refresh
+                    try:
+                        credentials.refresh(Request())
+                        logger.info(f"[get_credentials] Refreshed OAuth 2.1 credentials for session {session_id}")
+                        # Update stored credentials
+                        user_email = store.get_user_by_mcp_session(session_id)
+                        if user_email:
+                            store.store_session(
+                                user_email=user_email,
+                                access_token=credentials.token,
+                                refresh_token=credentials.refresh_token,
+                                scopes=credentials.scopes,
+                                expiry=credentials.expiry,
+                                mcp_session_id=session_id
+                            )
+                        return credentials
+                    except Exception as e:
+                        logger.error(f"[get_credentials] Failed to refresh OAuth 2.1 credentials: {e}")
+                        return None
         except ImportError:
             pass  # OAuth 2.1 store not available
         except Exception as e:
@@ -869,20 +588,27 @@ def get_credentials(
         logger.info(
             "[get_credentials] Single-user mode: bypassing session mapping, finding any credentials"
         )
-        credentials, found_user_email = _find_any_credentials(credentials_base_dir)
+        credentials = _find_any_credentials(credentials_base_dir)
         if not credentials:
             logger.info(
                 f"[get_credentials] Single-user mode: No credentials found in {credentials_base_dir}"
             )
             return None
 
-        # Use the email from the credential file if not provided
-        # This ensures we can save refreshed credentials even when the token is expired
-        if not user_google_email and found_user_email:
-            user_google_email = found_user_email
-            logger.debug(
-                f"[get_credentials] Single-user mode: using email {user_google_email} from credential file"
-            )
+        # In single-user mode, if user_google_email wasn't provided, try to get it from user info
+        # This is needed for proper credential saving after refresh
+        if not user_google_email and credentials.valid:
+            try:
+                user_info = get_user_info(credentials)
+                if user_info and "email" in user_info:
+                    user_google_email = user_info["email"]
+                    logger.debug(
+                        f"[get_credentials] Single-user mode: extracted user email {user_google_email} from credentials"
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"[get_credentials] Single-user mode: could not extract user email: {e}"
+                )
     else:
         credentials: Optional[Credentials] = None
 
@@ -894,7 +620,7 @@ def get_credentials(
             f"[get_credentials] Called for user_google_email: '{user_google_email}', session_id: '{session_id}', required_scopes: {required_scopes}"
         )
 
-        if session_id and not skip_session_cache:
+        if session_id:
             credentials = load_credentials_from_session(session_id)
             if credentials:
                 logger.debug(
@@ -917,10 +643,9 @@ def get_credentials(
                 logger.debug(
                     f"[get_credentials] Loaded from file for user '{user_google_email}', caching to session '{session_id}'."
                 )
-                if not skip_session_cache:
-                    save_credentials_to_session(
-                        session_id, credentials
-                    )  # Cache for current session
+                save_credentials_to_session(
+                    session_id, credentials
+                )  # Cache for current session
 
         if not credentials:
             logger.info(
@@ -932,22 +657,35 @@ def get_credentials(
         f"[get_credentials] Credentials found. Scopes: {credentials.scopes}, Valid: {credentials.valid}, Expired: {credentials.expired}"
     )
 
-    # Attempt refresh before checking scopes — the scope check validates against
-    # credentials.scopes which is set at authorization time and not updated by the
-    # google-auth library on refresh. Checking scopes first would block a valid
-    # refresh attempt when stored scope metadata is stale.
+    if not all(scope in credentials.scopes for scope in required_scopes):
+        logger.warning(
+            f"[get_credentials] Credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}. User: '{user_google_email}', Session: '{session_id}'"
+        )
+        return None  # Re-authentication needed for scopes
+
+    logger.debug(
+        f"[get_credentials] Credentials have sufficient scopes. User: '{user_google_email}', Session: '{session_id}'"
+    )
+
     if credentials.valid:
         logger.debug(
             f"[get_credentials] Credentials are valid. User: '{user_google_email}', Session: '{session_id}'"
         )
-    elif credentials.refresh_token:
+        return credentials
+    elif credentials.expired and credentials.refresh_token:
         logger.info(
-            f"[get_credentials] Credentials not valid. Attempting refresh. User: '{user_google_email}', Session: '{session_id}'"
+            f"[get_credentials] Credentials expired. Attempting refresh. User: '{user_google_email}', Session: '{session_id}'"
         )
+        if not client_secrets_path:
+            logger.error(
+                "[get_credentials] Client secrets path required for refresh but not provided."
+            )
+            return None
         try:
             logger.debug(
-                "[get_credentials] Refreshing token using embedded client credentials"
+                f"[get_credentials] Refreshing token using client_secrets_path: {client_secrets_path}"
             )
+            # client_config = load_client_secrets(client_secrets_path) # Not strictly needed if creds have client_id/secret
             credentials.refresh(Request())
             logger.info(
                 f"[get_credentials] Credentials refreshed successfully. User: '{user_google_email}', Session: '{session_id}'"
@@ -959,9 +697,7 @@ def get_credentials(
                     credential_store = get_credential_store()
                     credential_store.store_credential(user_google_email, credentials)
                 else:
-                    logger.info(
-                        f"Skipping credential file save in stateless mode for {user_google_email}"
-                    )
+                    logger.info(f"Skipping credential file save in stateless mode for {user_google_email}")
 
                 # Also update OAuth21SessionStore
                 store = get_oauth21_session_store()
@@ -975,11 +711,12 @@ def get_credentials(
                     scopes=credentials.scopes,
                     expiry=credentials.expiry,
                     mcp_session_id=session_id,
-                    issuer="https://accounts.google.com",  # Add issuer for Google tokens
+                    issuer="https://accounts.google.com"  # Add issuer for Google tokens
                 )
 
             if session_id:  # Update session cache if it was the source or is active
                 save_credentials_to_session(session_id, credentials)
+            return credentials
         except RefreshError as e:
             logger.warning(
                 f"[get_credentials] RefreshError - token expired/revoked: {e}. User: '{user_google_email}', Session: '{session_id}'"
@@ -998,31 +735,12 @@ def get_credentials(
         )
         return None
 
-    # Check scopes after refresh so stale scope metadata doesn't block valid tokens.
-    # Uses hierarchy-aware check (e.g. gmail.modify satisfies gmail.readonly).
-    if not has_required_scopes(credentials.scopes, required_scopes):
-        logger.warning(
-            f"[get_credentials] Credentials lack required scopes. Need: {required_scopes}, Have: {credentials.scopes}. User: '{user_google_email}', Session: '{session_id}'"
-        )
-        return None  # Re-authentication needed for scopes
 
-    logger.debug(
-        f"[get_credentials] Credentials have sufficient scopes. User: '{user_google_email}', Session: '{session_id}'"
-    )
-    return credentials
-
-
-def get_user_info(
-    credentials: Credentials, *, skip_valid_check: bool = False
-) -> Optional[Dict[str, Any]]:
+def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
     """Fetches basic user profile information (requires userinfo.email scope)."""
-    if not credentials:
-        logger.error("Cannot get user info: Missing credentials.")
+    if not credentials or not credentials.valid:
+        logger.error("Cannot get user info: Invalid or missing credentials.")
         return None
-    if not skip_valid_check and not credentials.valid:
-        logger.error("Cannot get user info: Invalid credentials.")
-        return None
-    service = None
     try:
         # Using googleapiclient discovery to get user info
         # Requires 'google-api-python-client' library
@@ -1037,9 +755,6 @@ def get_user_info(
     except Exception as e:
         logger.error(f"Unexpected error fetching user info: {e}")
         return None
-    finally:
-        if service:
-            service.close()
 
 
 # --- Centralized Google Service Authentication ---
@@ -1085,13 +800,9 @@ async def get_authenticated_google_service(
             # First try context variable (works in async context)
             session_id = get_fastmcp_session_id()
             if session_id:
-                logger.debug(
-                    f"[{tool_name}] Got FastMCP session ID from context: {session_id}"
-                )
+                logger.debug(f"[{tool_name}] Got FastMCP session ID from context: {session_id}")
             else:
-                logger.debug(
-                    f"[{tool_name}] Context variable returned None/empty session ID"
-                )
+                logger.debug(f"[{tool_name}] Context variable returned None/empty session ID")
         except Exception as e:
             logger.debug(
                 f"[{tool_name}] Could not get FastMCP session from context: {e}"
@@ -1101,25 +812,17 @@ async def get_authenticated_google_service(
         if not session_id and get_fastmcp_context:
             try:
                 fastmcp_ctx = get_fastmcp_context()
-                if fastmcp_ctx and hasattr(fastmcp_ctx, "session_id"):
+                if fastmcp_ctx and hasattr(fastmcp_ctx, 'session_id'):
                     session_id = fastmcp_ctx.session_id
-                    logger.debug(
-                        f"[{tool_name}] Got FastMCP session ID directly: {session_id}"
-                    )
+                    logger.debug(f"[{tool_name}] Got FastMCP session ID directly: {session_id}")
                 else:
-                    logger.debug(
-                        f"[{tool_name}] FastMCP context exists but no session_id attribute"
-                    )
+                    logger.debug(f"[{tool_name}] FastMCP context exists but no session_id attribute")
             except Exception as e:
-                logger.debug(
-                    f"[{tool_name}] Could not get FastMCP context directly: {e}"
-                )
+                logger.debug(f"[{tool_name}] Could not get FastMCP context directly: {e}")
 
         # Final fallback: log if we still don't have session_id
         if not session_id:
-            logger.warning(
-                f"[{tool_name}] Unable to obtain FastMCP session ID from any source"
-            )
+            logger.warning(f"[{tool_name}] Unable to obtain FastMCP session ID from any source")
 
     logger.info(
         f"[{tool_name}] Attempting to get authenticated {service_name} service. Email: '{user_google_email}', Session: '{session_id}'"
@@ -1131,34 +834,75 @@ async def get_authenticated_google_service(
         logger.info(f"[{tool_name}] {error_msg}")
         raise GoogleAuthenticationError(error_msg)
 
-    credentials = await asyncio.to_thread(
-        get_credentials,
-        user_google_email=user_google_email,
-        required_scopes=required_scopes,
-        client_secrets_path=CONFIG_CLIENT_SECRETS_PATH,
-        session_id=session_id,  # Pass through session context
-    )
-
-    if not credentials or not credentials.valid:
-        logger.warning(
-            f"[{tool_name}] No valid credentials. Email: '{user_google_email}'."
+    # Check if this is a service account (ends with .gserviceaccount.com)
+    is_service_account = user_google_email.endswith('.gserviceaccount.com')
+    
+    # Check for API key for public/readonly access (no auth needed!)
+    google_api_key = os.environ.get('GOOGLE_API_KEY')
+    
+    if google_api_key and not is_service_account:
+        logger.info(f"[{tool_name}] Using API key for public/readonly access")
+        try:
+            service = build(service_name, version, developerKey=google_api_key)
+            logger.info(f"[{tool_name}] Successfully built {service_name} service with API key")
+            return service, user_google_email
+        except Exception as e:
+            logger.warning(f"[{tool_name}] API key auth failed: {e}, falling back to other methods")
+            # Continue to service account or OAuth
+    
+    if is_service_account:
+        logger.info(f"[{tool_name}] Detected service account: {user_google_email}")
+        # Use service account authentication directly
+        try:
+            from google.oauth2 import service_account
+            
+            # Try GOOGLE_CLIENT_SECRET_PATH first, then CONFIG_CLIENT_SECRETS_PATH
+            service_account_file = os.environ.get('GOOGLE_CLIENT_SECRET_PATH') or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') or CONFIG_CLIENT_SECRETS_PATH
+            
+            if not os.path.exists(service_account_file):
+                raise GoogleAuthenticationError(
+                    f"Service account file not found: {service_account_file}. "
+                    f"Set GOOGLE_CLIENT_SECRET_PATH or GOOGLE_APPLICATION_CREDENTIALS environment variable."
+                )
+            
+            logger.info(f"[{tool_name}] Loading service account from: {service_account_file}")
+            credentials = service_account.Credentials.from_service_account_file(
+                service_account_file,
+                scopes=required_scopes
+            )
+            
+            if not credentials:
+                raise GoogleAuthenticationError(
+                    f"Failed to load service account credentials from {service_account_file}"
+                )
+                
+            logger.info(f"[{tool_name}] Service account authenticated successfully")
+            
+        except Exception as e:
+            error_msg = f"Failed to authenticate service account {user_google_email}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            raise GoogleAuthenticationError(error_msg)
+    else:
+        # Regular user OAuth flow
+        credentials = await asyncio.to_thread(
+            get_credentials,
+            user_google_email=user_google_email,
+            required_scopes=required_scopes,
+            client_secrets_path=CONFIG_CLIENT_SECRETS_PATH,
+            session_id=session_id,  # Pass through session context
         )
-        logger.info(
-            f"[{tool_name}] Valid email '{user_google_email}' provided, initiating auth flow."
-        )
 
-        redirect_uri = get_oauth_redirect_uri()
-        transport_mode = get_transport_mode()
-        if transport_mode == "stdio":
-            # Only stdio legacy OAuth depends on the standalone callback server.
+        if not credentials or not credentials.valid:
+            logger.warning(f"[{tool_name}] No valid credentials. Email: '{user_google_email}'.")
+            logger.info(f"[{tool_name}] Valid email '{user_google_email}' provided, initiating auth flow.")
+
+            # Ensure OAuth callback is available
             from auth.oauth_callback_server import ensure_oauth_callback_available
 
+            redirect_uri = get_oauth_redirect_uri()
             config = get_oauth_config()
-            success, error_msg = await asyncio.to_thread(
-                ensure_oauth_callback_available,
-                transport_mode,
-                config.port,
-                config.base_uri,
+            success, error_msg = ensure_oauth_callback_available(
+                get_transport_mode(), config.port, config.base_uri
             )
             if not success:
                 error_detail = f" ({error_msg})" if error_msg else ""
@@ -1166,22 +910,22 @@ async def get_authenticated_google_service(
                     f"Cannot initiate OAuth flow - callback server unavailable{error_detail}"
                 )
 
-        # Generate auth URL and raise exception with it
-        auth_response = await start_auth_flow(
-            user_google_email=user_google_email,
-            service_name=f"Google {service_name.title()}",
-            redirect_uri=redirect_uri,
-        )
+            # Generate auth URL and raise exception with it
+            auth_response = await start_auth_flow(
+                user_google_email=user_google_email,
+                service_name=f"Google {service_name.title()}",
+                redirect_uri=redirect_uri,
+            )
 
-        # Extract the auth URL from the response and raise with it
-        raise GoogleAuthenticationError(auth_response)
+            # Extract the auth URL from the response and raise with it
+            raise GoogleAuthenticationError(auth_response)
 
     try:
         service = build(service_name, version, credentials=credentials)
         log_user_email = user_google_email
 
-        # Try to get email from credentials if needed for validation
-        if credentials and credentials.id_token:
+        # Try to get email from credentials if needed for validation (OAuth only, not service accounts)
+        if credentials and hasattr(credentials, 'id_token') and credentials.id_token:
             try:
                 # Decode without verification (just to get email for logging)
                 decoded_token = jwt.decode(

@@ -1,39 +1,46 @@
-# ---- Python artefacts --------------------------------------------------
-__pycache__/
-*.py[cod]
-*.so
-.mcp.json
-claude.md
-.beads/*
-.beads/issues.jsonl
+# # ---- Python artefacts --------------------------------------------------
+# __pycache__/
+# *.py[cod]
+# *.so
+# .mcp.json
+# claude.md
 
-# ---- Packaging ---------------------------------------------------------
-*.egg-info/
-build/
-dist/
+# # ---- Packaging ---------------------------------------------------------
+# *.egg-info/
+# build/
+# dist/
 
-# ---- Environments & tooling -------------------------------------------
-.env
-.venv/
-venv/
-.idea/
-.vscode/
+# # ---- Environments & tooling -------------------------------------------
+# .env
+# .venv/
+# venv/
+# .idea/
+# .vscode/
 
-# ---- macOS clutter -----------------------------------------------------
-.DS_Store
+# # ---- macOS clutter -----------------------------------------------------
+# .DS_Store
 
-# ---- Secrets -----------------------------------------------------------
-client_secret.json
+# # ---- Secrets -----------------------------------------------------------
+# client_secret.json
 
-# ---- Logs --------------------------------------------------------------
-mcp_server_debug.log
+# # ---- Logs --------------------------------------------------------------
+# mcp_server_debug.log
 
-# ---- Local development files -------------------------------------------
-/.credentials
-/.claude
-.serena/
-Caddyfile
-ecosystem.config.cjs
+# # ---- Local development files -------------------------------------------
+# /.credentials
+# /.claude
 
-# ---- Agent instructions (not for distribution) -------------------------
-.github/instructions/
+# Viventium public-release hardening
+        .env
+        .env.*
+        !.env.example
+        !.env.oauth21
+        node_modules/
+        .venv*/
+        __pycache__/
+        .local_artifacts/
+        tmp/
+        backups/
+        artifacts/
+        videos/
+        har/

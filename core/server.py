@@ -1,31 +1,20 @@
-import asyncio
-import hashlib
 import logging
-import os
 from typing import List, Optional
 from importlib import metadata
 
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.applications import Starlette
-from starlette.datastructures import MutableHeaders
-from starlette.types import Scope, Receive, Send
 from starlette.requests import Request
 from starlette.middleware import Middleware
 
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.google import GoogleProvider
-
 from auth.oauth21_session_store import get_oauth21_session_store, set_auth_provider
 from auth.google_auth import handle_auth_callback, start_auth_flow, check_client_secrets
-from auth.oauth_config import is_oauth21_enabled, is_external_oauth21_provider
 from auth.mcp_session_middleware import MCPSessionMiddleware
-from auth.oauth_responses import (
-    create_error_response,
-    create_success_response,
-    create_server_error_response,
-)
+from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
 from auth.auth_info_middleware import AuthInfoMiddleware
-from auth.scopes import SCOPES, get_current_scopes  # noqa
+from auth.scopes import SCOPES, get_current_scopes # noqa
+from auth.persistent_google_provider import PersistentGoogleProvider
 from core.config import (
     USER_GOOGLE_EMAIL,
     get_transport_mode,
@@ -36,93 +25,210 @@ from core.config import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-_auth_provider: Optional[GoogleProvider] = None
+_auth_provider: Optional[PersistentGoogleProvider] = None
 _legacy_callback_registered = False
 
 session_middleware = Middleware(MCPSessionMiddleware)
 
-
-class WellKnownCacheControlMiddleware:
-    """Force no-cache headers for OAuth well-known discovery endpoints."""
-
+# ASGI middleware to fix missing client_id in token requests
+class TokenClientIdFixMiddleware:
+    """
+    Raw ASGI middleware that intercepts /token POST requests and adds
+    missing client_id before the request reaches the MCP SDK's token handler.
+    """
     def __init__(self, app):
         self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+    
+    async def __call__(self, scope, receive, send):
+        from urllib.parse import parse_qs, urlencode
+        
+        if scope["type"] == "http" and scope["path"] == "/token" and scope["method"] == "POST":
+            logger.info("[TokenFix] Intercepting /token request")
+            
+            # Collect the body
+            body_parts = []
+            while True:
+                message = await receive()
+                body_parts.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            
+            body = b"".join(body_parts)
+            body_str = body.decode('utf-8')
+            form_data = parse_qs(body_str)
+            
+            logger.info(f"[TokenFix] Original fields: {list(form_data.keys())}")
+            
+            # Get config for fallback values
+            from auth.oauth_config import get_oauth_config
+            config = get_oauth_config()
+            
+            # Check if client_id is missing
+            if 'client_id' not in form_data or not form_data.get('client_id', [''])[0]:
+                logger.info("[TokenFix] client_id is missing")
+                
+                # Try to get client_id from code data
+                code = form_data.get('code', [''])[0]
+                client_id_added = False
+                
+                if code and _auth_provider:
+                    code_data = _auth_provider._client_codes.get(code)
+                    if code_data and 'client_id' in code_data:
+                        form_data['client_id'] = [code_data['client_id']]
+                        logger.info(f"[TokenFix] Added client_id from code: {code_data['client_id'][:30]}...")
+                        client_id_added = True
+                
+                # Fallback to config
+                if not client_id_added and config.client_id:
+                    form_data['client_id'] = [config.client_id]
+                    logger.info(f"[TokenFix] Added fallback client_id: {config.client_id[:30]}...")
+            
+            # Also add client_secret if missing (some OAuth implementations require it)
+            if 'client_secret' not in form_data or not form_data.get('client_secret', [''])[0]:
+                if config.client_secret:
+                    form_data['client_secret'] = [config.client_secret]
+                    logger.info("[TokenFix] Added client_secret")
+                
+                # Rebuild the body
+                flat_data = {k: v[0] if isinstance(v, list) and len(v) == 1 else v for k, v in form_data.items()}
+                body = urlencode(flat_data, doseq=True).encode('utf-8')
+                logger.info(f"[TokenFix] Modified fields: {list(flat_data.keys())}")
+            
+            # Update content-length header
+            new_headers = []
+            for name, value in scope.get('headers', []):
+                if name.lower() == b'content-length':
+                    new_headers.append((b'content-length', str(len(body)).encode()))
+                else:
+                    new_headers.append((name, value))
+            
+            new_scope = dict(scope)
+            new_scope['headers'] = new_headers
+            
+            # Create new receive that returns our modified body
+            body_sent = False
+            async def new_receive():
+                nonlocal body_sent
+                if not body_sent:
+                    body_sent = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.request", "body": b"", "more_body": False}
+            
+            await self.app(new_scope, new_receive, send)
+        else:
             await self.app(scope, receive, send)
-            return
-
-        path = scope.get("path", "")
-        is_oauth_well_known = (
-            path == "/.well-known/oauth-authorization-server"
-            or path.startswith("/.well-known/oauth-authorization-server/")
-            or path == "/.well-known/oauth-protected-resource"
-            or path.startswith("/.well-known/oauth-protected-resource/")
-        )
-        if not is_oauth_well_known:
-            await self.app(scope, receive, send)
-            return
-
-        async def send_with_no_cache_headers(message):
-            if message["type"] == "http.response.start":
-                headers = MutableHeaders(raw=message.setdefault("headers", []))
-                headers["Cache-Control"] = "no-store, must-revalidate"
-                headers["ETag"] = f'"{_compute_scope_fingerprint()}"'
-            await send(message)
-
-        await self.app(scope, receive, send_with_no_cache_headers)
 
 
-well_known_cache_control_middleware = Middleware(WellKnownCacheControlMiddleware)
-
-
-def _compute_scope_fingerprint() -> str:
-    """Compute a short hash of the current scope configuration for cache-busting."""
-    scopes_str = ",".join(sorted(get_current_scopes()))
-    return hashlib.sha256(scopes_str.encode()).hexdigest()[:12]
-
-
-# Custom FastMCP that adds secure middleware stack for OAuth 2.1
+# Custom FastMCP that adds secure middleware stack and token fix for OAuth 2.1
 class SecureFastMCP(FastMCP):
-    def http_app(self, **kwargs) -> "Starlette":
-        """Override to add secure middleware stack for OAuth 2.1."""
-        app = super().http_app(**kwargs)
+    def http_app(self, path=None, middleware=None, json_response=None, stateless_http=None, transport="http"):
+        """Override to wrap the app with our ASGI middleware."""
+        # Call parent to create the base app
+        app = super().http_app(
+            path=path,
+            middleware=middleware,
+            json_response=json_response,
+            stateless_http=stateless_http,
+            transport=transport
+        )
 
-        # Add middleware in order (first added = outermost layer)
-        app.user_middleware.insert(0, well_known_cache_control_middleware)
-
-        # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(1, session_middleware)
-
-        # Rebuild middleware stack
+        # Add session middleware
+        app.user_middleware.insert(0, session_middleware)
         app.middleware_stack = app.build_middleware_stack()
-        logger.info("Added middleware stack: WellKnownCacheControl, Session Management")
-        return app
+        
+        # Wrap the entire app with our ASGI middleware
+        wrapped_app = TokenClientIdFixMiddleware(app)
+        
+        # Return a wrapper that looks like a Starlette app
+        class WrappedStarletteApp:
+            def __init__(self, middleware_app, original_app):
+                self._middleware_app = middleware_app
+                self._original_app = original_app
+                # Copy attributes from original app for compatibility
+                for attr in ['routes', 'state', 'debug', 'middleware_stack', 'exception_handlers', 'on_startup', 'on_shutdown']:
+                    if hasattr(original_app, attr):
+                        setattr(self, attr, getattr(original_app, attr))
+            
+            async def __call__(self, scope, receive, send):
+                await self._middleware_app(scope, receive, send)
+        
+        logger.info("[TokenFix] Added TokenClientIdFix ASGI middleware wrapper")
+        return WrappedStarletteApp(wrapped_app, app)
 
 
-# Build server instructions with user email context for single-user mode
-_server_instructions = None
-if USER_GOOGLE_EMAIL:
-    _server_instructions = f"""Connected Google account: {USER_GOOGLE_EMAIL}
+async def _auto_register_upstream_client_impl() -> None:
+    """
+    Auto-register the upstream Google client_id as a valid DCR client.
+    
+    This allows LibreChat (and other MCP clients) to use the Google client_id
+    directly in the /authorize request without needing to do DCR first.
+    """
+    global _auth_provider
+    
+    logger.info("=== Auto-register upstream client starting ===")
+    
+    if _auth_provider is None:
+        logger.warning("No auth provider configured, skipping upstream client auto-registration")
+        return
+    
+    logger.info(f"Auth provider is configured: {type(_auth_provider).__name__}")
+    
+    try:
+        from auth.oauth_config import get_oauth_config
+        from mcp.shared.auth import OAuthClientInformationFull
+        from pydantic import AnyUrl
+        
+        config = get_oauth_config()
+        logger.info(f"OAuth config loaded, client_id present: {bool(config.client_id)}")
+        
+        if not config.client_id:
+            logger.warning("No Google client_id configured, skipping auto-registration")
+            return
+        
+        logger.info(f"Will register client_id: {config.client_id[:30]}...")
+        
+        # Check if already registered
+        existing = await _auth_provider.get_client(config.client_id)
+        if existing:
+            logger.info(f"Upstream Google client already registered: {config.client_id[:30]}...")
+            return
+        
+        logger.info("Client not found, proceeding with registration...")
+        
+        redirect_uris = config.get_redirect_uris() if hasattr(config, "get_redirect_uris") else []
+        if not redirect_uris:
+            redirect_uris = [config.redirect_uri]
 
-When using Google Workspace tools, always use `{USER_GOOGLE_EMAIL}` as the `user_google_email` parameter. Do not ask the user for their email address."""
-    logger.info(f"Server instructions configured for user: {USER_GOOGLE_EMAIL}")
+        # Create client info with the Google client_id
+        client_info = OAuthClientInformationFull(
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            redirect_uris=[AnyUrl(uri) for uri in redirect_uris],
+            grant_types=["authorization_code", "refresh_token"],
+            response_types=["code"],
+            client_name="LibreChat-Google-Workspace",
+            token_endpoint_auth_method="client_secret_post",
+        )
+        
+        logger.info("Calling register_client...")
+        await _auth_provider.register_client(client_info)
+        logger.info(f"=== Auto-registered upstream Google client: {config.client_id[:30]}... ===")
+        
+        # Verify registration
+        verify = await _auth_provider.get_client(config.client_id)
+        logger.info(f"Verification after registration: client found = {verify is not None}")
+        
+    except Exception as e:
+        logger.error(f"Failed to auto-register upstream client: {e}", exc_info=True)
 
 server = SecureFastMCP(
     name="google_workspace",
     auth=None,
-    instructions=_server_instructions,
 )
 
 # Add the AuthInfo middleware to inject authentication into FastMCP context
 auth_info_middleware = AuthInfoMiddleware()
 server.add_middleware(auth_info_middleware)
-
-
-def _parse_bool_env(value: str) -> bool:
-    """Parse environment variable string to boolean."""
-    return value.lower() in ("1", "true", "yes", "on")
 
 
 def set_transport_mode(mode: str):
@@ -137,6 +243,95 @@ def _ensure_legacy_callback_route() -> None:
         return
     server.custom_route("/oauth2callback", methods=["GET"])(legacy_oauth2_callback)
     _legacy_callback_registered = True
+
+def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None:
+    """
+    Pre-seed the upstream Google client_id into the provider's client storage.
+    
+    This writes directly to the JSON file storage to ensure the client is
+    available immediately when the server starts, without needing async.
+    """
+    import json
+    from pathlib import Path
+    from datetime import datetime
+    import fastmcp
+    
+    try:
+        # Get the client storage directory
+        cache_dir = fastmcp.settings.home / "oauth-proxy-clients"
+        cache_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Create safe filename from client_id
+        safe_key = config.client_id
+        for char in [".", "/", "\\", ":", "*", "?", '"', "<", ">", "|", " "]:
+            safe_key = safe_key.replace(char, "_")
+        while "__" in safe_key:
+            safe_key = safe_key.replace("__", "_")
+        safe_key = safe_key.strip("_")
+        
+        file_path = cache_dir / f"{safe_key}.json"
+        
+        redirect_uris = config.get_redirect_uris() if hasattr(config, "get_redirect_uris") else []
+        if not redirect_uris:
+            redirect_uris = [config.redirect_uri]
+
+        # Get the configured scopes
+        from auth.scopes import get_current_scopes
+        scopes = get_current_scopes()
+        scope_string = " ".join(sorted(scopes)) if scopes else None
+
+        # === VIVENTIUM START ===
+        # Feature: Refresh stale pre-seeded OAuth client files when runtime redirects drift.
+        # Purpose: Prevent isolated local runs from reusing old cloud/compat callback URIs.
+        # === VIVENTIUM END ===
+        if file_path.exists():
+            try:
+                existing_wrapper = json.loads(file_path.read_text())
+                existing_client = existing_wrapper.get("data", {}).get("client", {})
+                existing_redirects = existing_client.get("redirect_uris") or []
+                if (
+                    existing_client.get("client_id") == config.client_id and
+                    existing_client.get("client_secret") == config.client_secret and
+                    existing_client.get("scope") == scope_string and
+                    existing_redirects == redirect_uris
+                ):
+                    logger.info(f"Client already pre-seeded: {config.client_id[:30]}...")
+                    return
+                logger.info(
+                    f"Refreshing pre-seeded client for {config.client_id[:30]}... due to redirect/scope drift"
+                )
+            except Exception as e:
+                logger.warning(f"Failed reading existing pre-seeded client file {file_path}: {e}")
+
+        # Create the client data structure expected by get_client()
+        client_data = {
+            "client_id": config.client_id,
+            "client_secret": config.client_secret,
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": scope_string,
+            "token_endpoint_auth_method": "none",
+            "client_name": "LibreChat-Google-Workspace",
+        }
+        
+        storage_data = {
+            "client": client_data,
+            "allowed_redirect_uri_patterns": ["*"],  # Allow any redirect URI
+        }
+        
+        # Wrap with metadata as expected by JSONFileStorage
+        wrapper = {
+            "data": storage_data,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        
+        # Write to file
+        file_path.write_text(json.dumps(wrapper, indent=2))
+        logger.info(f"Pre-seeded upstream client: {config.client_id[:30]}... at {file_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to pre-seed upstream client: {e}", exc_info=True)
 
 
 def configure_server_for_http():
@@ -153,7 +348,6 @@ def configure_server_for_http():
 
     # Use centralized OAuth configuration
     from auth.oauth_config import get_oauth_config
-
     config = get_oauth_config()
 
     # Check if OAuth 2.1 is enabled via centralized config
@@ -164,292 +358,30 @@ def configure_server_for_http():
             logger.warning("OAuth 2.1 enabled but OAuth credentials not configured")
             return
 
-        def validate_and_derive_jwt_key(
-            jwt_signing_key_override: str | None, client_secret: str
-        ) -> bytes:
-            """Validate JWT signing key override and derive the final JWT key."""
-            if jwt_signing_key_override:
-                if len(jwt_signing_key_override) < 12:
-                    logger.warning(
-                        "OAuth 2.1: FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY is less than 12 characters; "
-                        "use a longer secret to improve key derivation strength."
-                    )
-                return derive_jwt_key(
-                    low_entropy_material=jwt_signing_key_override,
-                    salt="fastmcp-jwt-signing-key",
-                )
-            else:
-                return derive_jwt_key(
-                    high_entropy_material=client_secret,
-                    salt="fastmcp-jwt-signing-key",
-                )
-
         try:
-            # Import common dependencies for storage backends
-            from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
-            from cryptography.fernet import Fernet
-            from fastmcp.server.auth.jwt_issuer import derive_jwt_key
-
             required_scopes: List[str] = sorted(get_current_scopes())
-
-            client_storage = None
-            jwt_signing_key_override = (
-                os.getenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", "").strip()
-                or None
+            provider = PersistentGoogleProvider(
+                client_id=config.client_id,
+                client_secret=config.client_secret,
+                base_url=config.get_oauth_base_url(),
+                redirect_path=config.redirect_path,
+                required_scopes=required_scopes,
             )
-            storage_backend = (
-                os.getenv("WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND", "")
-                .strip()
-                .lower()
-            )
-            valkey_host = os.getenv("WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST", "").strip()
-
-            # Determine storage backend: valkey, disk, memory (default)
-            use_valkey = storage_backend == "valkey" or bool(valkey_host)
-            use_disk = storage_backend == "disk"
-
-            if use_valkey:
-                try:
-                    from key_value.aio.stores.valkey import ValkeyStore
-
-                    valkey_port_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PORT", "6379"
-                    ).strip()
-                    valkey_db_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_DB", "0"
-                    ).strip()
-
-                    valkey_port = int(valkey_port_raw)
-                    valkey_db = int(valkey_db_raw)
-                    valkey_use_tls_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USE_TLS", ""
-                    ).strip()
-                    valkey_use_tls = (
-                        _parse_bool_env(valkey_use_tls_raw)
-                        if valkey_use_tls_raw
-                        else valkey_port == 6380
-                    )
-
-                    valkey_request_timeout_ms_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_REQUEST_TIMEOUT_MS", ""
-                    ).strip()
-                    valkey_connection_timeout_ms_raw = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_CONNECTION_TIMEOUT_MS", ""
-                    ).strip()
-
-                    valkey_request_timeout_ms = (
-                        int(valkey_request_timeout_ms_raw)
-                        if valkey_request_timeout_ms_raw
-                        else None
-                    )
-                    valkey_connection_timeout_ms = (
-                        int(valkey_connection_timeout_ms_raw)
-                        if valkey_connection_timeout_ms_raw
-                        else None
-                    )
-
-                    valkey_username = (
-                        os.getenv(
-                            "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_USERNAME", ""
-                        ).strip()
-                        or None
-                    )
-                    valkey_password = (
-                        os.getenv(
-                            "WORKSPACE_MCP_OAUTH_PROXY_VALKEY_PASSWORD", ""
-                        ).strip()
-                        or None
-                    )
-
-                    if not valkey_host:
-                        valkey_host = "localhost"
-
-                    client_storage = ValkeyStore(
-                        host=valkey_host,
-                        port=valkey_port,
-                        db=valkey_db,
-                        username=valkey_username,
-                        password=valkey_password,
-                    )
-
-                    # Configure TLS and timeouts on the underlying Glide client config.
-                    # ValkeyStore currently doesn't expose these settings directly.
-                    glide_config = getattr(client_storage, "_client_config", None)
-                    if glide_config is not None:
-                        glide_config.use_tls = valkey_use_tls
-
-                        is_remote_host = valkey_host not in {"localhost", "127.0.0.1"}
-                        if valkey_request_timeout_ms is None and (
-                            valkey_use_tls or is_remote_host
-                        ):
-                            # Glide defaults to 250ms if unset; increase for remote/TLS endpoints.
-                            valkey_request_timeout_ms = 5000
-                        if valkey_request_timeout_ms is not None:
-                            glide_config.request_timeout = valkey_request_timeout_ms
-
-                        if valkey_connection_timeout_ms is None and (
-                            valkey_use_tls or is_remote_host
-                        ):
-                            valkey_connection_timeout_ms = 10000
-                        if valkey_connection_timeout_ms is not None:
-                            from glide_shared.config import (
-                                AdvancedGlideClientConfiguration,
-                            )
-
-                            glide_config.advanced_config = (
-                                AdvancedGlideClientConfiguration(
-                                    connection_timeout=valkey_connection_timeout_ms
-                                )
-                            )
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
-                    )
-
-                    client_storage = FernetEncryptionWrapper(
-                        key_value=client_storage,
-                        fernet=Fernet(key=storage_encryption_key),
-                    )
-                    logger.info(
-                        "OAuth 2.1: Using ValkeyStore for FastMCP OAuth proxy client_storage (host=%s, port=%s, db=%s, tls=%s)",
-                        valkey_host,
-                        valkey_port,
-                        valkey_db,
-                        valkey_use_tls,
-                    )
-                    if valkey_request_timeout_ms is not None:
-                        logger.info(
-                            "OAuth 2.1: Valkey request timeout set to %sms",
-                            valkey_request_timeout_ms,
-                        )
-                    if valkey_connection_timeout_ms is not None:
-                        logger.info(
-                            "OAuth 2.1: Valkey connection timeout set to %sms",
-                            valkey_connection_timeout_ms,
-                        )
-                    logger.info(
-                        "OAuth 2.1: Applied Fernet encryption wrapper to Valkey client_storage (key derived from FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY or GOOGLE_OAUTH_CLIENT_SECRET)."
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Valkey client_storage requested but Valkey dependencies are not installed (%s). "
-                        "Install 'workspace-mcp[valkey]' (or 'py-key-value-aio[valkey]', which includes 'valkey-glide') "
-                        "or unset WORKSPACE_MCP_OAUTH_PROXY_STORAGE_BACKEND/WORKSPACE_MCP_OAUTH_PROXY_VALKEY_HOST.",
-                        exc,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Invalid Valkey configuration; falling back to default storage (%s).",
-                        exc,
-                    )
-            elif use_disk:
-                try:
-                    from core.storage import make_sanitized_file_store
-
-                    disk_directory = os.getenv(
-                        "WORKSPACE_MCP_OAUTH_PROXY_DISK_DIRECTORY", ""
-                    ).strip()
-                    if not disk_directory:
-                        # Default to FASTMCP_HOME/oauth-proxy or ~/.fastmcp/oauth-proxy
-                        fastmcp_home = os.getenv("FASTMCP_HOME", "").strip()
-                        if fastmcp_home:
-                            disk_directory = os.path.join(fastmcp_home, "oauth-proxy")
-                        else:
-                            disk_directory = os.path.expanduser(
-                                "~/.fastmcp/oauth-proxy"
-                            )
-
-                    client_storage = make_sanitized_file_store(disk_directory)
-
-                    jwt_signing_key = validate_and_derive_jwt_key(
-                        jwt_signing_key_override, config.client_secret
-                    )
-
-                    storage_encryption_key = derive_jwt_key(
-                        high_entropy_material=jwt_signing_key.decode(),
-                        salt="fastmcp-storage-encryption-key",
-                    )
-
-                    client_storage = FernetEncryptionWrapper(
-                        key_value=client_storage,
-                        fernet=Fernet(key=storage_encryption_key),
-                    )
-                    logger.info(
-                        "OAuth 2.1: Using FileTreeStore for FastMCP OAuth proxy client_storage (directory=%s)",
-                        disk_directory,
-                    )
-                except ImportError as exc:
-                    logger.warning(
-                        "OAuth 2.1: Disk storage requested but dependencies not available (%s). "
-                        "Falling back to default storage.",
-                        exc,
-                    )
-            elif storage_backend == "memory":
-                from key_value.aio.stores.memory import MemoryStore
-
-                client_storage = MemoryStore()
-                logger.info(
-                    "OAuth 2.1: Using MemoryStore for FastMCP OAuth proxy client_storage"
-                )
-            # else: client_storage remains None, FastMCP uses its default
-
-            # Ensure JWT signing key is always derived for all storage backends
-            if "jwt_signing_key" not in locals():
-                jwt_signing_key = validate_and_derive_jwt_key(
-                    jwt_signing_key_override, config.client_secret
-                )
-
-            # Check if external OAuth provider is configured
-            if config.is_external_oauth21_provider():
-                # External OAuth mode: use custom provider that handles ya29.* access tokens
-                from auth.external_oauth_provider import ExternalOAuthProvider
-
-                provider = ExternalOAuthProvider(
-                    client_id=config.client_id,
-                    client_secret=config.client_secret,
-                    base_url=config.get_oauth_base_url(),
-                    redirect_path=config.redirect_path,
-                    required_scopes=required_scopes,
-                    resource_server_url=config.get_oauth_base_url(),
-                )
-                server.auth = provider
-
-                logger.info("OAuth 2.1 enabled with EXTERNAL provider mode")
-                logger.info(
-                    "Expecting Authorization bearer tokens in tool call headers"
-                )
-                logger.info(
-                    "Protected resource metadata points to Google's authorization server"
-                )
-            else:
-                # Standard OAuth 2.1 mode: use FastMCP's GoogleProvider
-                provider = GoogleProvider(
-                    client_id=config.client_id,
-                    client_secret=config.client_secret,
-                    base_url=config.get_oauth_base_url(),
-                    redirect_path=config.redirect_path,
-                    required_scopes=required_scopes,
-                    client_storage=client_storage,
-                    jwt_signing_key=jwt_signing_key,
-                )
-                # Enable protocol-level auth
-                server.auth = provider
-                logger.info(
-                    "OAuth 2.1 enabled using FastMCP GoogleProvider with protocol-level auth"
-                )
-
-            # Always set auth provider for token validation in middleware
+            # VIVENTIUM: Google must be forced into offline consent or local MCP auth
+            # only receives short-lived access tokens and breaks again on expiry.
+            extra_authorize_params = getattr(provider, "_extra_authorize_params", None)
+            if isinstance(extra_authorize_params, dict):
+                extra_authorize_params["access_type"] = "offline"
+                extra_authorize_params["prompt"] = "consent"
+            server.auth = provider
             set_auth_provider(provider)
+            logger.info("OAuth 2.1 enabled using FastMCP GoogleProvider")
             _auth_provider = provider
+            
+            # Pre-seed the upstream client into storage synchronously
+            _preseed_upstream_client(provider, config)
         except Exception as exc:
-            logger.error(
-                "Failed to initialize FastMCP GoogleProvider: %s", exc, exc_info=True
-            )
+            logger.error("Failed to initialize FastMCP GoogleProvider: %s", exc, exc_info=True)
             raise
     else:
         logger.info("OAuth 2.0 mode - Server will use legacy authentication.")
@@ -459,52 +391,37 @@ def configure_server_for_http():
         _ensure_legacy_callback_route()
 
 
-def get_auth_provider() -> Optional[GoogleProvider]:
+def get_auth_provider() -> Optional[PersistentGoogleProvider]:
     """Gets the global authentication provider instance."""
     return _auth_provider
 
-
-@server.custom_route("/", methods=["GET"])
 @server.custom_route("/health", methods=["GET"])
 async def health_check(request: Request):
     try:
         version = metadata.version("workspace-mcp")
     except metadata.PackageNotFoundError:
         version = "dev"
-    return JSONResponse(
-        {
-            "status": "healthy",
-            "service": "workspace-mcp",
-            "version": version,
-            "transport": get_transport_mode(),
-        }
-    )
+    return JSONResponse({
+        "status": "healthy",
+        "service": "workspace-mcp",
+        "version": version,
+        "transport": get_transport_mode()
+    })
 
-
-@server.custom_route("/attachments/{file_id}", methods=["GET"])
-async def serve_attachment(request: Request):
-    """Serve a stored attachment file."""
-    from core.attachment_storage import get_attachment_storage
-
-    file_id = request.path_params["file_id"]
-    storage = get_attachment_storage()
-    metadata = storage.get_attachment_metadata(file_id)
-
-    if not metadata:
-        return JSONResponse(
-            {"error": "Attachment not found or expired"}, status_code=404
-        )
-
-    file_path = storage.get_attachment_path(file_id)
-    if not file_path:
-        return JSONResponse({"error": "Attachment file not found"}, status_code=404)
-
-    return FileResponse(
-        path=str(file_path),
-        filename=metadata["filename"],
-        media_type=metadata["mime_type"],
-    )
-
+@server.custom_route("/debug/register-upstream", methods=["POST"])
+async def debug_register_upstream(request: Request):
+    """Debug endpoint to manually trigger upstream client registration."""
+    try:
+        await _auto_register_upstream_client_impl()
+        return JSONResponse({
+            "status": "success",
+            "message": "Upstream client registration triggered"
+        })
+    except Exception as e:
+        return JSONResponse({
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
 
 async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
@@ -512,9 +429,7 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     error = request.query_params.get("error")
 
     if error:
-        msg = (
-            f"Authentication failed: Google returned an error: {error}. State: {state}."
-        )
+        msg = f"Authentication failed: Google returned an error: {error}. State: {state}."
         logger.error(msg)
         return create_error_response(msg)
 
@@ -528,22 +443,20 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         if error_message:
             return create_server_error_response(error_message)
 
-        logger.info("OAuth callback: Received authorization code.")
+        logger.info(f"OAuth callback: Received code (state: {state}).")
 
         mcp_session_id = None
-        if hasattr(request, "state") and hasattr(request.state, "session_id"):
+        if hasattr(request, 'state') and hasattr(request.state, 'session_id'):
             mcp_session_id = request.state.session_id
 
         verified_user_id, credentials = handle_auth_callback(
             scopes=get_current_scopes(),
             authorization_response=str(request.url),
             redirect_uri=get_oauth_redirect_uri_for_current_mode(),
-            session_id=mcp_session_id,
+            session_id=mcp_session_id
         )
 
-        logger.info(
-            f"OAuth callback: Successfully authenticated user: {verified_user_id}."
-        )
+        logger.info(f"OAuth callback: Successfully authenticated user: {verified_user_id}.")
 
         try:
             store = get_oauth21_session_store()
@@ -560,9 +473,7 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
                 session_id=f"google-{state}",
                 mcp_session_id=mcp_session_id,
             )
-            logger.info(
-                f"Stored Google credentials in OAuth 2.1 session store for {verified_user_id}"
-            )
+            logger.info(f"Stored Google credentials in OAuth 2.1 session store for {verified_user_id}")
         except Exception as e:
             logger.error(f"Failed to store credentials in OAuth 2.1 store: {e}")
 
@@ -571,17 +482,14 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
         return create_server_error_response(str(e))
 
-
 @server.tool()
-async def start_google_auth(
-    service_name: str, user_google_email: str = USER_GOOGLE_EMAIL
-) -> str:
+async def start_google_auth(service_name: str, user_google_email: str = USER_GOOGLE_EMAIL) -> str:
     """
     Manually initiate Google OAuth authentication flow.
 
-    NOTE: This is a legacy OAuth 2.0 tool and is disabled when OAuth 2.1 is enabled.
-    The authentication system automatically handles credential checks and prompts for
-    authentication when needed. Only use this tool if:
+    NOTE: This tool should typically NOT be called directly. The authentication system
+    automatically handles credential checks and prompts for authentication when needed.
+    Only use this tool if:
     1. You need to re-authenticate with different credentials
     2. You want to proactively authenticate before using other tools
     3. The automatic authentication flow failed and you need to retry
@@ -589,48 +497,26 @@ async def start_google_auth(
     In most cases, simply try calling the Google Workspace tool you need - it will
     automatically handle authentication if required.
     """
-    if is_oauth21_enabled():
-        if is_external_oauth21_provider():
-            return (
-                "start_google_auth is disabled when OAuth 2.1 is enabled. "
-                "Provide a valid OAuth 2.1 bearer token in the Authorization header "
-                "and retry the original tool."
-            )
-        return (
-            "start_google_auth is disabled when OAuth 2.1 is enabled. "
-            "Authenticate through your MCP client's OAuth 2.1 flow and retry the "
-            "original tool."
-        )
-
     if not user_google_email:
         raise ValueError("user_google_email must be provided.")
+
+    # Check if this is a service account
+    if user_google_email.endswith('.gserviceaccount.com'):
+        return (
+            f"**Service Account Detected:** {user_google_email}\n\n"
+            f"Service accounts authenticate automatically using their JSON key file. "
+            f"No manual authentication needed - just use the Google Workspace tools directly!"
+        )
 
     error_message = check_client_secrets()
     if error_message:
         return f"**Authentication Error:** {error_message}"
 
     try:
-        transport_mode = get_transport_mode()
-        if transport_mode == "stdio":
-            # Only stdio legacy OAuth depends on the standalone callback server.
-            from auth.oauth_callback_server import ensure_oauth_callback_available
-            from auth.oauth_config import get_oauth_config
-
-            config = get_oauth_config()
-            success, error_msg = await asyncio.to_thread(
-                ensure_oauth_callback_available,
-                transport_mode,
-                config.port,
-                config.base_uri,
-            )
-            if not success:
-                error_detail = f" ({error_msg})" if error_msg else ""
-                return f"**Error:** Cannot initiate OAuth flow - callback server unavailable{error_detail}"
-
         auth_message = await start_auth_flow(
             user_google_email=user_google_email,
             service_name=service_name,
-            redirect_uri=get_oauth_redirect_uri_for_current_mode(),
+            redirect_uri=get_oauth_redirect_uri_for_current_mode()
         )
         return auth_message
     except Exception as e:

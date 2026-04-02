@@ -6,7 +6,6 @@ In stdio mode: Starts a minimal HTTP server just for OAuth callbacks
 """
 
 import asyncio
-import errno
 import logging
 import threading
 import time
@@ -14,21 +13,15 @@ import socket
 import uvicorn
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional
 from urllib.parse import urlparse
 
-from auth.scopes import SCOPES, get_current_scopes  # noqa
-from auth.oauth_responses import (
-    create_error_response,
-    create_success_response,
-    create_server_error_response,
-)
+from auth.scopes import SCOPES, get_current_scopes # noqa
+from auth.oauth_responses import create_error_response, create_success_response, create_server_error_response
 from auth.google_auth import handle_auth_callback, check_client_secrets
 from auth.oauth_config import get_oauth_redirect_uri
 
 logger = logging.getLogger(__name__)
-
 
 class MinimalOAuthServer:
     """
@@ -46,8 +39,6 @@ class MinimalOAuthServer:
 
         # Setup the callback route
         self._setup_callback_route()
-        # Setup attachment serving route
-        self._setup_attachment_route()
 
     def _setup_callback_route(self):
         """Setup the OAuth callback route."""
@@ -55,20 +46,17 @@ class MinimalOAuthServer:
         @self.app.get("/oauth2callback")
         async def oauth_callback(request: Request):
             """Handle OAuth callback - same logic as in core/server.py"""
+            state = request.query_params.get("state")
             code = request.query_params.get("code")
             error = request.query_params.get("error")
 
             if error:
-                error_message = (
-                    f"Authentication failed: Google returned an error: {error}."
-                )
+                error_message = f"Authentication failed: Google returned an error: {error}. State: {state}."
                 logger.error(error_message)
                 return create_error_response(error_message)
 
             if not code:
-                error_message = (
-                    "Authentication failed: No authorization code received from Google."
-                )
+                error_message = "Authentication failed: No authorization code received from Google."
                 logger.error(error_message)
                 return create_error_response(error_message)
 
@@ -78,9 +66,7 @@ class MinimalOAuthServer:
                 if error_message:
                     return create_server_error_response(error_message)
 
-                logger.info(
-                    "OAuth callback: Received authorization code. Attempting to exchange for tokens."
-                )
+                logger.info(f"OAuth callback: Received code (state: {state}). Attempting to exchange for tokens.")
 
                 # Session ID tracking removed - not needed
 
@@ -90,105 +76,18 @@ class MinimalOAuthServer:
                     scopes=get_current_scopes(),
                     authorization_response=str(request.url),
                     redirect_uri=redirect_uri,
-                    session_id=None,
+                    session_id=None
                 )
 
-                logger.info(
-                    f"OAuth callback: Successfully authenticated user: {verified_user_id}."
-                )
+                logger.info(f"OAuth callback: Successfully authenticated user: {verified_user_id} (state: {state}).")
 
                 # Return success page using shared template
                 return create_success_response(verified_user_id)
 
             except Exception as e:
-                error_message_detail = f"Error processing OAuth callback: {str(e)}"
+                error_message_detail = f"Error processing OAuth callback (state: {state}): {str(e)}"
                 logger.error(error_message_detail, exc_info=True)
                 return create_server_error_response(str(e))
-
-    def _setup_attachment_route(self):
-        """Setup the attachment serving route."""
-        from core.attachment_storage import get_attachment_storage
-
-        @self.app.get("/attachments/{file_id}")
-        async def serve_attachment(file_id: str, request: Request):
-            """Serve a stored attachment file."""
-            storage = get_attachment_storage()
-            metadata = storage.get_attachment_metadata(file_id)
-
-            if not metadata:
-                return JSONResponse(
-                    {"error": "Attachment not found or expired"}, status_code=404
-                )
-
-            file_path = storage.get_attachment_path(file_id)
-            if not file_path:
-                return JSONResponse(
-                    {"error": "Attachment file not found"}, status_code=404
-                )
-
-            return FileResponse(
-                path=str(file_path),
-                filename=metadata["filename"],
-                media_type=metadata["mime_type"],
-            )
-
-    def is_actually_running(self) -> bool:
-        """
-        Check whether the callback port is currently usable.
-
-        A fresh MinimalOAuthServer starts with ``is_running=False`` in the constructor,
-        but ``ensure_oauth_callback_available()`` still calls this method before deciding
-        whether ``start()`` needs to bind the shared callback port. Keep the active
-        connection probe first, then treat ``EADDRINUSE`` from a short-lived bind as
-        another instance already owning the callback endpoint.
-        """
-        if self.server_thread and not self.server_thread.is_alive():
-            return False
-        try:
-            parsed_uri = urlparse(self.base_uri)
-            hostname = parsed_uri.hostname or "localhost"
-        except Exception:
-            hostname = "localhost"
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0)
-                if s.connect_ex((hostname, self.port)) == 0:
-                    return True
-        except Exception:
-            return False
-
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind((hostname, self.port))
-        except OSError as exc:
-            if exc.errno == errno.EADDRINUSE:
-                return True
-            return False
-        except Exception:
-            return False
-
-        return False
-
-    def matches_endpoint(self, port: int, base_uri: str) -> bool:
-        """Return True when this server instance matches the requested callback endpoint."""
-        if self.port != port:
-            return False
-        self_parsed = urlparse(self.base_uri)
-        other_parsed = urlparse(base_uri)
-        if self_parsed.scheme.lower() != other_parsed.scheme.lower():
-            return False
-        if (self_parsed.hostname or "").lower() != (
-            other_parsed.hostname or ""
-        ).lower():
-            return False
-        default_port = 443 if self_parsed.scheme.lower() == "https" else 80
-        self_port = self_parsed.port or default_port
-        other_port = other_parsed.port or default_port
-        if self_port != other_port:
-            return False
-        self_path = self_parsed.path.rstrip("/") or ""
-        other_path = other_parsed.path.rstrip("/") or ""
-        return self_path == other_path
 
     def start(self) -> tuple[bool, str]:
         """
@@ -198,24 +97,16 @@ class MinimalOAuthServer:
             Tuple of (success: bool, error_message: str)
         """
         if self.is_running:
-            if self.is_actually_running():
-                logger.info("Minimal OAuth server is already running")
-                return True, ""
-            else:
-                logger.warning(
-                    "Minimal OAuth server was marked running but port is not responding. Restarting."
-                )
-                self.stop()
-                self.server = None
-                self.server_thread = None
+            logger.info("Minimal OAuth server is already running")
+            return True, ""
 
         # Check if port is available
         # Extract hostname from base_uri (e.g., "http://localhost" -> "localhost")
         try:
             parsed_uri = urlparse(self.base_uri)
-            hostname = parsed_uri.hostname or "localhost"
+            hostname = parsed_uri.hostname or 'localhost'
         except Exception:
-            hostname = "localhost"
+            hostname = 'localhost'
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -233,7 +124,7 @@ class MinimalOAuthServer:
                     host=hostname,
                     port=self.port,
                     log_level="warning",
-                    access_log=False,
+                    access_log=False
                 )
                 self.server = uvicorn.Server(config)
                 asyncio.run(self.server.serve())
@@ -255,9 +146,7 @@ class MinimalOAuthServer:
                     result = s.connect_ex((hostname, self.port))
                     if result == 0:
                         self.is_running = True
-                        logger.info(
-                            f"Minimal OAuth server started on {hostname}:{self.port}"
-                        )
+                        logger.info(f"Minimal OAuth server started on {hostname}:{self.port}")
                         return True, ""
             except Exception:
                 pass
@@ -274,7 +163,7 @@ class MinimalOAuthServer:
 
         try:
             if self.server:
-                if hasattr(self.server, "should_exit"):
+                if hasattr(self.server, 'should_exit'):
                     self.server.should_exit = True
 
             if self.server_thread and self.server_thread.is_alive():
@@ -289,12 +178,8 @@ class MinimalOAuthServer:
 
 # Global instance for stdio mode
 _minimal_oauth_server: Optional[MinimalOAuthServer] = None
-_minimal_oauth_server_lock = threading.Lock()
 
-
-def ensure_oauth_callback_available(
-    transport_mode: str = "stdio", port: int = 8000, base_uri: str = "http://localhost"
-) -> tuple[bool, str]:
+def ensure_oauth_callback_available(transport_mode: str = "stdio", port: int = 8000, base_uri: str = "http://localhost") -> tuple[bool, str]:
     """
     Ensure OAuth callback endpoint is available for the given transport mode.
 
@@ -313,60 +198,36 @@ def ensure_oauth_callback_available(
 
     if transport_mode == "streamable-http":
         # In streamable-http mode, the main FastAPI server should handle callbacks
-        logger.debug(
-            "Using existing FastAPI server for OAuth callbacks (streamable-http mode)"
-        )
+        logger.debug("Using existing FastAPI server for OAuth callbacks (streamable-http mode)")
         return True, ""
 
     elif transport_mode == "stdio":
-        with _minimal_oauth_server_lock:
-            # In stdio mode, start or refresh the minimal callback server as needed.
-            if _minimal_oauth_server and not _minimal_oauth_server.matches_endpoint(
-                port, base_uri
-            ):
-                logger.info(
-                    "OAuth callback endpoint changed from %s:%s to %s:%s; recreating minimal OAuth server",
-                    _minimal_oauth_server.base_uri,
-                    _minimal_oauth_server.port,
-                    base_uri,
-                    port,
-                )
-                _minimal_oauth_server.stop()
-                _minimal_oauth_server = None
+        # In stdio mode, start minimal server if not already running
+        if _minimal_oauth_server is None:
+            logger.info(f"Creating minimal OAuth server instance for {base_uri}:{port}")
+            _minimal_oauth_server = MinimalOAuthServer(port, base_uri)
 
-            if _minimal_oauth_server is None:
-                logger.info(
-                    f"Creating minimal OAuth server instance for {base_uri}:{port}"
-                )
-                _minimal_oauth_server = MinimalOAuthServer(port, base_uri)
-
-            if not _minimal_oauth_server.is_actually_running():
-                logger.info("Starting minimal OAuth server for stdio mode")
-                success, error_msg = _minimal_oauth_server.start()
-                if success:
-                    logger.info(
-                        f"Minimal OAuth server successfully started on {base_uri}:{port}"
-                    )
-                    return True, ""
-                else:
-                    logger.error(
-                        f"Failed to start minimal OAuth server on {base_uri}:{port}: {error_msg}"
-                    )
-                    return False, error_msg
-            else:
-                logger.info("Minimal OAuth server is already running")
+        if not _minimal_oauth_server.is_running:
+            logger.info("Starting minimal OAuth server for stdio mode")
+            success, error_msg = _minimal_oauth_server.start()
+            if success:
+                logger.info(f"Minimal OAuth server successfully started on {base_uri}:{port}")
                 return True, ""
+            else:
+                logger.error(f"Failed to start minimal OAuth server on {base_uri}:{port}: {error_msg}")
+                return False, error_msg
+        else:
+            logger.info("Minimal OAuth server is already running")
+            return True, ""
 
     else:
         error_msg = f"Unknown transport mode: {transport_mode}"
         logger.error(error_msg)
         return False, error_msg
 
-
 def cleanup_oauth_callback_server():
     """Clean up the minimal OAuth server if it was started."""
     global _minimal_oauth_server
-    with _minimal_oauth_server_lock:
-        if _minimal_oauth_server:
-            _minimal_oauth_server.stop()
-            _minimal_oauth_server = None
+    if _minimal_oauth_server:
+        _minimal_oauth_server.stop()
+        _minimal_oauth_server = None
