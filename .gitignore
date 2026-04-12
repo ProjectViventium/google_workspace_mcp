@@ -31,16 +31,31 @@
 # /.claude
 
 # Viventium public-release hardening
-        .env
-        .env.*
-        !.env.example
-        !.env.oauth21
-        node_modules/
-        .venv*/
-        __pycache__/
-        .local_artifacts/
-        tmp/
-        backups/
-        artifacts/
-        videos/
-        har/
+.env
+.env.*
+!.env.example
+!.env.oauth21
+node_modules/
+.venv*/
+venv/
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.DS_Store
+client_secret.json
+mcp_server_debug.log
+/.credentials
+/.claude
+.mcp.json
+claude.md
+.local_artifacts/
+tmp/
+backups/
+artifacts/
+videos/
+har/
