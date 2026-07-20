@@ -635,7 +635,7 @@ export GOOGLE_CLIENT_SECRET_PATH=\
 
 **⚡ .env File**
 ```bash
-cp .env.oauth21 .env
+cp .env.oauth21.example .env
 # Edit .env with credentials
 ```
 <sub>Best for development</sub>

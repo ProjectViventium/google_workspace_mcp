@@ -1,7 +1,6 @@
 import argparse
 import logging
 import os
-import socket
 import sys
 from importlib import metadata, import_module
 from dotenv import load_dotenv

@@ -3,7 +3,6 @@ from typing import List, Optional
 from importlib import metadata
 
 from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.middleware import Middleware
 
@@ -252,7 +251,6 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
     available immediately when the server starts, without needing async.
     """
     import json
-    from pathlib import Path
     from datetime import datetime
     import fastmcp
     
