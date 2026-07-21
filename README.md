@@ -147,6 +147,10 @@ uv run main.py --tools gmail drive
 **Why DXT?**
 > Desktop Extensions (`.dxt`) bundle the server, dependencies, and manifest so users go from download → working MCP in **one click** – no terminal, no JSON editing, no version conflicts.
 
+Release maintainers must build the checked-in extension with `uv run python scripts/build_dxt.py`.
+The builder packages only the explicit git-tracked runtime allowlist, verifies that the manifest and
+Python project versions match, and emits a reproducible archive without local caches or credentials.
+
 #### Required Configuration
 <details>
 <summary>◆ <b>Environment Variables</b> <sub><sup>← Click to configure in Claude Desktop</sup></sub></summary>
