@@ -1,9 +1,16 @@
+import importlib.util
 from pathlib import Path
 import zipfile
 
 import pytest
 
-from scripts.build_dxt import build_bundle, collect_bundle_files
+_BUILD_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_dxt.py"
+_SPEC = importlib.util.spec_from_file_location("google_workspace_mcp_build_dxt", _BUILD_SCRIPT)
+assert _SPEC is not None and _SPEC.loader is not None
+_BUILD_DXT = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_BUILD_DXT)
+build_bundle = _BUILD_DXT.build_bundle
+collect_bundle_files = _BUILD_DXT.collect_bundle_files
 
 
 def test_bundle_inventory_excludes_local_and_stale_artifacts():
