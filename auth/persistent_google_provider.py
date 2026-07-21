@@ -3,13 +3,78 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import fastmcp
 from fastmcp.server.auth.providers.google import GoogleProvider
+from fastmcp.utilities.storage import JSONFileStorage
 from mcp.server.auth.provider import RefreshToken
 
+from auth.secure_storage import (
+    StorageSecurityError,
+    atomic_write_private_json,
+    ensure_private_directory,
+    list_private_json_files,
+    read_private_json,
+    remove_private_file,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class SecureJSONFileStorage(JSONFileStorage):
+    """FastMCP-compatible client registration storage with private atomic files."""
+
+    def __init__(self, cache_dir: Path):
+        ensure_private_directory(cache_dir)
+        super().__init__(cache_dir)
+        ensure_private_directory(cache_dir)
+
+    async def get(self, key: str) -> dict[str, Any] | None:
+        path = self._get_file_path(key)
+        try:
+            wrapper = read_private_json(path, repair_mode=True)
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to load OAuth client %r: %s", key, exc)
+            return None
+        if not isinstance(wrapper, dict) or "data" not in wrapper:
+            logger.warning("Invalid OAuth client storage format for key %r", key)
+            return None
+        return wrapper["data"]
+
+    async def set(self, key: str, value: dict[str, Any]) -> None:
+        wrapper = {"data": value, "timestamp": time.time()}
+        atomic_write_private_json(self._get_file_path(key), wrapper, indent=None)
+
+    async def delete(self, key: str) -> None:
+        remove_private_file(self._get_file_path(key))
+
+    async def cleanup_old_entries(
+        self,
+        max_age_seconds: int = 30 * 24 * 60 * 60,
+    ) -> int:
+        current_time = time.time()
+        removed_count = 0
+        for json_file in list_private_json_files(
+            self.cache_dir, repair_mode=True
+        ):
+            try:
+                wrapper = read_private_json(json_file, repair_mode=True)
+                timestamp = wrapper.get("timestamp") if isinstance(wrapper, dict) else None
+                if isinstance(timestamp, str):
+                    timestamp = datetime.fromisoformat(timestamp).timestamp()
+                if not isinstance(timestamp, (int, float)):
+                    continue
+                if current_time - timestamp > max_age_seconds:
+                    remove_private_file(json_file)
+                    removed_count += 1
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+        return removed_count
 
 
 class PersistentGoogleProvider(GoogleProvider):
@@ -20,9 +85,12 @@ class PersistentGoogleProvider(GoogleProvider):
     # tokens to become invalid after each Google MCP restart.
     # === VIVENTIUM END ===
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        client_dir = fastmcp.settings.home / "oauth-proxy-clients"
+        ensure_private_directory(client_dir)
+        kwargs.setdefault("client_storage", SecureJSONFileStorage(client_dir))
         super().__init__(*args, **kwargs)
         token_dir = fastmcp.settings.home / "oauth-proxy-tokens"
-        token_dir.mkdir(exist_ok=True, parents=True)
+        ensure_private_directory(token_dir)
         self._refresh_token_state_path = token_dir / "google_refresh_tokens.json"
         self._load_persisted_refresh_tokens()
 
@@ -39,7 +107,11 @@ class PersistentGoogleProvider(GoogleProvider):
             return
 
         try:
-            payload = json.loads(self._refresh_token_state_path.read_text())
+            payload = read_private_json(
+                self._refresh_token_state_path, repair_mode=True
+            )
+        except StorageSecurityError:
+            raise
         except Exception as exc:
             logger.warning(
                 "Failed to read persisted Google refresh-token state from %s: %s",
@@ -85,15 +157,14 @@ class PersistentGoogleProvider(GoogleProvider):
         )
 
         if not refresh_tokens:
-            if self._refresh_token_state_path.exists():
-                self._refresh_token_state_path.unlink()
+            remove_private_file(self._refresh_token_state_path)
             return
 
         payload = {
             "refresh_tokens": refresh_tokens,
             "updated_at": int(time.time()),
         }
-        self._refresh_token_state_path.write_text(json.dumps(payload, indent=2))
+        atomic_write_private_json(self._refresh_token_state_path, payload, indent=2)
 
     def persist_refresh_token_for_access_token(self, access_token: str) -> bool:
         # === VIVENTIUM START ===

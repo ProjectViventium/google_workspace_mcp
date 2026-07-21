@@ -26,11 +26,12 @@ user@example.com                                    -> OAuth user flow
 4. Add your configured callback endpoints
 5. Download the generated client credentials JSON
 
-Use generic callback patterns such as:
+Register exact callback URLs. Wildcards are rejected. Use HTTPS for an external
+callback, or HTTP only for a loopback callback, for example:
 
 ```text
-http://<oauth-host>/oauth2callback
-http://<oauth-host>/oauth2callback/debug
+https://oauth.example.com/oauth2callback
+http://127.0.0.1:8000/oauth2callback
 ```
 
 ### 2. Configure Environment
@@ -41,7 +42,13 @@ export GOOGLE_OAUTH_CLIENT_SECRET="your-client-secret"
 
 # Optional alternative
 export GOOGLE_CLIENT_SECRET_PATH="/path/to/oauth-client.json"
+chmod 600 /path/to/oauth-client.json
 ```
+
+The file must be a regular file owned by the runtime user; symbolic links and
+group/world-readable modes are rejected. Streamable HTTP listens on
+`127.0.0.1` unless a deployment explicitly sets both a remote
+`WORKSPACE_MCP_BIND_HOST` and `WORKSPACE_MCP_ALLOW_REMOTE_BIND=true`.
 
 ### 3. Enable Required APIs
 

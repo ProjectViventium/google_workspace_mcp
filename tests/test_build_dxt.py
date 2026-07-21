@@ -14,6 +14,7 @@ def test_bundle_inventory_excludes_local_and_stale_artifacts():
     assert "manifest.json" in bundle_files
     assert "uv.lock" in bundle_files
     assert "auth/google_auth.py" in bundle_files
+    assert "auth/secure_storage.py" in bundle_files
     assert not any(".ruff_cache" in path for path in bundle_files)
     assert not any(path.endswith(".dxt") for path in bundle_files)
     assert "changes_since_120.txt" not in bundle_files
@@ -31,6 +32,7 @@ def test_build_bundle_is_version_aligned_and_reproducible(tmp_path):
     with zipfile.ZipFile(first) as archive:
         manifest = archive.read("manifest.json").decode()
         assert '"version": "1.5.2"' in manifest
+        assert "auth/secure_storage.py" in archive.namelist()
         assert ".ruff_cache/CACHEDIR.TAG" not in archive.namelist()
 
 

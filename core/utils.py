@@ -6,12 +6,19 @@ import xml.etree.ElementTree as ET
 import ssl
 import asyncio
 import functools
+import secrets
+from pathlib import Path
 
 from typing import List, Optional
 
 from googleapiclient.errors import HttpError
 from .api_enablement import get_api_enablement_message
 from auth.google_auth import GoogleAuthenticationError
+from auth.secure_storage import (
+    atomic_write_private_json,
+    ensure_private_directory,
+    remove_private_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,44 +45,21 @@ def check_credentials_directory_permissions(credentials_dir: str = None) -> None
 
         credentials_dir = get_default_credentials_dir()
 
+    permission_probe = Path(credentials_dir) / (
+        f".permission-test-{secrets.token_hex(8)}.json"
+    )
     try:
-        # Check if directory exists
-        if os.path.exists(credentials_dir):
-            # Directory exists, check if we can write to it
-            test_file = os.path.join(credentials_dir, ".permission_test")
-            try:
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Credentials directory permissions check passed: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                raise PermissionError(
-                    f"Cannot write to existing credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
-        else:
-            # Directory doesn't exist, try to create it and its parent directories
-            try:
-                os.makedirs(credentials_dir, exist_ok=True)
-                # Test writing to the new directory
-                test_file = os.path.join(credentials_dir, ".permission_test")
-                with open(test_file, "w") as f:
-                    f.write("test")
-                os.remove(test_file)
-                logger.info(
-                    f"Created credentials directory with proper permissions: {os.path.abspath(credentials_dir)}"
-                )
-            except (PermissionError, OSError) as e:
-                # Clean up if we created the directory but can't write to it
-                try:
-                    if os.path.exists(credentials_dir):
-                        os.rmdir(credentials_dir)
-                except (PermissionError, OSError):
-                    pass
-                raise PermissionError(
-                    f"Cannot create or write to credentials directory '{os.path.abspath(credentials_dir)}': {e}"
-                )
+        ensure_private_directory(credentials_dir)
+        atomic_write_private_json(
+            permission_probe,
+            {"permission_test": True},
+            indent=None,
+        )
+        remove_private_file(permission_probe)
+        logger.info(
+            "Credentials directory permissions check passed: %s",
+            os.path.abspath(credentials_dir),
+        )
 
     except PermissionError:
         raise

@@ -9,6 +9,7 @@ from auth.oauth_config import reload_oauth_config, is_stateless_mode
 from core.log_formatter import EnhancedLogFormatter, configure_file_logging
 from core.utils import check_credentials_directory_permissions
 from core.server import server, set_transport_mode, configure_server_for_http
+from core.config import resolve_http_bind_host
 from core.tool_tier_loader import resolve_tools_from_tier
 from core.tool_registry import set_enabled_tools as set_enabled_tool_names, wrap_server_tool_method, filter_server_tools
 
@@ -57,7 +58,10 @@ def configure_safe_logging():
     # Replace all console handlers' formatters with safe enhanced ones
     for handler in logging.root.handlers:
         # Only apply to console/stream handlers, keep file handlers as-is
-        if isinstance(handler, logging.StreamHandler) and handler.stream.name in ['<stderr>', '<stdout>']:
+        if (
+            isinstance(handler, logging.StreamHandler)
+            and getattr(handler.stream, "name", None) in ["<stderr>", "<stdout>"]
+        ):
             safe_formatter = SafeEnhancedFormatter(use_colors=True)
             handler.setFormatter(safe_formatter)
 
@@ -86,6 +90,7 @@ def main():
     # Set port and base URI once for reuse throughout the function
     port = int(os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", 8000)))
     base_uri = os.getenv("WORKSPACE_MCP_BASE_URI", "http://localhost")
+    bind_host = resolve_http_bind_host() if args.transport == "streamable-http" else None
     external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
     display_url = external_url if external_url else f"{base_uri}:{port}"
 
@@ -246,7 +251,7 @@ def main():
         if args.transport == 'streamable-http':
             configure_server_for_http()
             safe_print("")
-            safe_print(f"🚀 Starting HTTP server on {base_uri}:{port}")
+            safe_print(f"🚀 Starting HTTP server on {bind_host}:{port}")
             if external_url:
                 safe_print(f"   External URL: {external_url}")
         else:
@@ -270,7 +275,7 @@ def main():
             # Let the underlying ASGI server own the bind lifecycle.
             # A manual pre-bind here can falsely reject rapid restart cycles on macOS
             # even when the real server would recover on the requested port.
-            server.run(transport="streamable-http", host="0.0.0.0", port=port)
+            server.run(transport="streamable-http", host=bind_host, port=port)
         else:
             server.run()
     except KeyboardInterrupt:

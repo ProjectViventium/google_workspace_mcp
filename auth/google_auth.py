@@ -19,6 +19,7 @@ from auth.scopes import SCOPES, get_current_scopes # noqa
 from auth.oauth21_session_store import get_oauth21_session_store
 from auth.credential_store import get_credential_store
 from auth.oauth_config import get_oauth_config, is_stateless_mode
+from auth.secure_storage import StorageSecurityError, read_private_json
 from core.config import (
     get_transport_mode,
     get_oauth_redirect_uri,
@@ -199,6 +200,20 @@ def load_client_secrets_from_env() -> Optional[Dict[str, Any]]:
     return None
 
 
+def _load_client_secrets_document(client_secrets_path: str) -> Dict[str, Any]:
+    """Read a Google OAuth client document through the private-file boundary."""
+    client_config = read_private_json(
+        client_secrets_path,
+        repair_mode=False,
+        private_directory=False,
+    )
+    if not isinstance(client_config, dict) or not (
+        "web" in client_config or "installed" in client_config
+    ):
+        raise ValueError("Invalid client secrets file format")
+    return client_config
+
+
 def load_client_secrets(client_secrets_path: str) -> Dict[str, Any]:
     """
     Loads the client secrets from environment variables (preferred) or from the client secrets file.
@@ -225,24 +240,25 @@ def load_client_secrets(client_secrets_path: str) -> Dict[str, Any]:
 
     # Fall back to loading from file
     try:
-        with open(client_secrets_path, "r") as f:
-            client_config = json.load(f)
-            # The file usually contains a top-level key like "web" or "installed"
-            if "web" in client_config:
-                logger.info(
-                    f"Loaded OAuth client credentials from file: {client_secrets_path}"
-                )
-                return client_config["web"]
-            elif "installed" in client_config:
-                logger.info(
-                    f"Loaded OAuth client credentials from file: {client_secrets_path}"
-                )
-                return client_config["installed"]
-            else:
-                logger.error(
-                    f"Client secrets file {client_secrets_path} has unexpected format."
-                )
-                raise ValueError("Invalid client secrets file format")
+        client_config = _load_client_secrets_document(client_secrets_path)
+        # The file usually contains a top-level key like "web" or "installed"
+        if "web" in client_config:
+            logger.info(
+                f"Loaded OAuth client credentials from file: {client_secrets_path}"
+            )
+            return client_config["web"]
+        elif "installed" in client_config:
+            logger.info(
+                f"Loaded OAuth client credentials from file: {client_secrets_path}"
+            )
+            return client_config["installed"]
+        else:
+            logger.error(
+                f"Client secrets file {client_secrets_path} has unexpected format."
+            )
+            raise ValueError("Invalid client secrets file format")
+    except StorageSecurityError:
+        raise
     except (IOError, json.JSONDecodeError) as e:
         logger.error(f"Error loading client secrets file {client_secrets_path}: {e}")
         raise
@@ -257,11 +273,17 @@ def check_client_secrets() -> Optional[str]:
         An error message string if secrets are not found, otherwise None.
     """
     env_config = load_client_secrets_from_env()
-    if not env_config and not os.path.exists(CONFIG_CLIENT_SECRETS_PATH):
-        logger.error(
-            f"OAuth client credentials not found. No environment variables set and no file at {CONFIG_CLIENT_SECRETS_PATH}"
-        )
-        return f"OAuth client credentials not found. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables or provide a client secrets file at {CONFIG_CLIENT_SECRETS_PATH}."
+    if not env_config:
+        if not os.path.exists(CONFIG_CLIENT_SECRETS_PATH):
+            logger.error(
+                f"OAuth client credentials not found. No environment variables set and no file at {CONFIG_CLIENT_SECRETS_PATH}"
+            )
+            return f"OAuth client credentials not found. Please set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET environment variables or provide a client secrets file at {CONFIG_CLIENT_SECRETS_PATH}."
+        try:
+            load_client_secrets(CONFIG_CLIENT_SECRETS_PATH)
+        except (StorageSecurityError, IOError, ValueError) as exc:
+            logger.error("OAuth client credentials file is unsafe or invalid: %s", exc)
+            return f"OAuth client credentials file is unsafe or invalid: {exc}"
     return None
 
 
@@ -285,8 +307,9 @@ def create_oauth_flow(
             f"OAuth client secrets file not found at {CONFIG_CLIENT_SECRETS_PATH} and no environment variables set"
         )
 
-    flow = Flow.from_client_secrets_file(
-        CONFIG_CLIENT_SECRETS_PATH,
+    client_config = _load_client_secrets_document(CONFIG_CLIENT_SECRETS_PATH)
+    flow = Flow.from_client_config(
+        client_config,
         scopes=scopes,
         redirect_uri=redirect_uri,
         state=state,

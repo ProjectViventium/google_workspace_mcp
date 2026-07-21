@@ -22,7 +22,7 @@ RUN useradd --create-home --shell /bin/bash app \
 # Give read and write access to the store_creds volume
 RUN mkdir -p /app/store_creds \
     && chown -R app:app /app/store_creds \
-    && chmod 755 /app/store_creds
+    && chmod 700 /app/store_creds
 
 USER app
 
@@ -39,6 +39,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # Set environment variables for Python startup args
 ENV TOOL_TIER=""
 ENV TOOLS=""
+# Container networking is an explicit remote-bind deployment boundary.
+ENV WORKSPACE_MCP_BIND_HOST="0.0.0.0"
+ENV WORKSPACE_MCP_ALLOW_REMOTE_BIND="true"
 
 # Use entrypoint for the base command and CMD for args
 ENTRYPOINT ["/bin/sh", "-c"]

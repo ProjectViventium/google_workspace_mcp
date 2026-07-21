@@ -9,6 +9,7 @@ Supports both OAuth 2.0 and OAuth 2.1 with automatic client capability detection
 """
 
 import os
+import ipaddress
 from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any
 
@@ -51,6 +52,7 @@ class OAuthConfig:
         # Redirect URI configuration
         self.redirect_uri = self._get_redirect_uri()
         self.redirect_path = self._get_redirect_path(self.redirect_uri)
+        self.get_redirect_uris()
 
         # Ensure FastMCP's Google provider picks up our existing configuration
         self._apply_fastmcp_google_env()
@@ -108,10 +110,43 @@ class OAuthConfig:
         # Custom redirect URIs from environment
         custom_uris = os.getenv("OAUTH_CUSTOM_REDIRECT_URIS")
         if custom_uris:
-            uris.extend([uri.strip() for uri in custom_uris.split(",")])
+            uris.extend(
+                uri.strip() for uri in custom_uris.split(",") if uri.strip()
+            )
 
         # Remove duplicates while preserving order
-        return list(dict.fromkeys(uris))
+        unique_uris = list(dict.fromkeys(uris))
+        for uri in unique_uris:
+            self._validate_registered_redirect_uri(uri)
+        return unique_uris
+
+    @staticmethod
+    def _is_loopback_hostname(hostname: Optional[str]) -> bool:
+        if not hostname:
+            return False
+        if hostname.lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return False
+
+    @classmethod
+    def _validate_registered_redirect_uri(cls, uri: str) -> None:
+        """Reject wildcard, ambiguous, or cleartext remote redirect entries."""
+        if "*" in uri:
+            raise ValueError("OAuth redirect URIs must not contain wildcard patterns")
+        parsed = urlparse(uri)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(
+                "OAuth redirect URIs must be absolute HTTP(S) URLs registered exactly"
+            )
+        if parsed.username or parsed.password or parsed.fragment:
+            raise ValueError(
+                "OAuth redirect URIs must not contain credentials or fragments"
+            )
+        if parsed.scheme != "https" and not cls._is_loopback_hostname(parsed.hostname):
+            raise ValueError("External OAuth redirect URIs must use HTTPS")
 
     def get_allowed_origins(self) -> List[str]:
         """

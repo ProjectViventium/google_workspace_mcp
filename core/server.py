@@ -14,6 +14,12 @@ from auth.oauth_responses import create_error_response, create_success_response,
 from auth.auth_info_middleware import AuthInfoMiddleware
 from auth.scopes import SCOPES, get_current_scopes # noqa
 from auth.persistent_google_provider import PersistentGoogleProvider
+from auth.secure_storage import (
+    StorageSecurityError,
+    atomic_write_private_json,
+    ensure_private_directory,
+    read_private_json,
+)
 from core.config import (
     USER_GOOGLE_EMAIL,
     get_transport_mode,
@@ -250,14 +256,13 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
     This writes directly to the JSON file storage to ensure the client is
     available immediately when the server starts, without needing async.
     """
-    import json
     from datetime import datetime
     import fastmcp
     
     try:
         # Get the client storage directory
         cache_dir = fastmcp.settings.home / "oauth-proxy-clients"
-        cache_dir.mkdir(exist_ok=True, parents=True)
+        ensure_private_directory(cache_dir)
         
         # Create safe filename from client_id
         safe_key = config.client_id
@@ -284,7 +289,7 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
         # === VIVENTIUM END ===
         if file_path.exists():
             try:
-                existing_wrapper = json.loads(file_path.read_text())
+                existing_wrapper = read_private_json(file_path, repair_mode=True)
                 existing_client = existing_wrapper.get("data", {}).get("client", {})
                 existing_redirects = existing_client.get("redirect_uris") or []
                 if (
@@ -298,6 +303,8 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
                 logger.info(
                     f"Refreshing pre-seeded client for {config.client_id[:30]}... due to redirect/scope drift"
                 )
+            except StorageSecurityError:
+                raise
             except Exception as e:
                 logger.warning(f"Failed reading existing pre-seeded client file {file_path}: {e}")
 
@@ -315,7 +322,7 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
         
         storage_data = {
             "client": client_data,
-            "allowed_redirect_uri_patterns": ["*"],  # Allow any redirect URI
+            "allowed_redirect_uri_patterns": redirect_uris,
         }
         
         # Wrap with metadata as expected by JSONFileStorage
@@ -324,10 +331,12 @@ def _preseed_upstream_client(provider: PersistentGoogleProvider, config) -> None
             "timestamp": datetime.utcnow().isoformat(),
         }
         
-        # Write to file
-        file_path.write_text(json.dumps(wrapper, indent=2))
+        # Replace atomically so interruption cannot corrupt a working client.
+        atomic_write_private_json(file_path, wrapper, indent=2)
         logger.info(f"Pre-seeded upstream client: {config.client_id[:30]}... at {file_path}")
         
+    except StorageSecurityError:
+        raise
     except Exception as e:
         logger.error(f"Failed to pre-seed upstream client: {e}", exc_info=True)
 
@@ -364,6 +373,7 @@ def configure_server_for_http():
                 base_url=config.get_oauth_base_url(),
                 redirect_path=config.redirect_path,
                 required_scopes=required_scopes,
+                allowed_client_redirect_uris=config.get_redirect_uris(),
             )
             # VIVENTIUM: Google must be forced into offline consent or local MCP auth
             # only receives short-lived access tokens and breaks again on expiry.
