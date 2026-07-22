@@ -75,10 +75,13 @@ affinity: {}
 env:
   # Server configuration
   WORKSPACE_MCP_PORT: "8000"
+  # Kubernetes service exposure is an explicit remote-bind deployment boundary.
+  WORKSPACE_MCP_BIND_HOST: "0.0.0.0"
+  WORKSPACE_MCP_ALLOW_REMOTE_BIND: "true"
   # Set the base URI for your Kubernetes environment
   # For internal cluster access: "http://{{ include "workspace-mcp.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local"
   # For external access: "https://your-domain.com" or "http://your-ingress-host"
-  WORKSPACE_MCP_BASE_URI: ""
+  WORKSPACE_MCP_BASE_URI: "http://localhost"
   
   # External URL for reverse proxy setups (e.g., "https://your-domain.com")
   # If set, this overrides the base_uri:port combination for OAuth endpoints

@@ -147,6 +147,10 @@ uv run main.py --tools gmail drive
 **Why DXT?**
 > Desktop Extensions (`.dxt`) bundle the server, dependencies, and manifest so users go from download → working MCP in **one click** – no terminal, no JSON editing, no version conflicts.
 
+Release maintainers must build the checked-in extension with `uv run python scripts/build_dxt.py`.
+The builder packages only the explicit git-tracked runtime allowlist, verifies that the manifest and
+Python project versions match, and emits a reproducible archive without local caches or credentials.
+
 #### Required Configuration
 <details>
 <summary>◆ <b>Environment Variables</b> <sub><sup>← Click to configure in Claude Desktop</sup></sub></summary>
@@ -171,6 +175,8 @@ uv run main.py --tools gmail drive
 | `GOOGLE_PSE_ENGINE_ID` | Search Engine ID for Custom Search |
 | `MCP_ENABLE_OAUTH21` | Set to `true` for OAuth 2.1 support |
 | `WORKSPACE_MCP_STATELESS_MODE` | Set to `true` for stateless operation (requires OAuth 2.1) |
+| `WORKSPACE_MCP_BIND_HOST` | HTTP listen host; defaults to `127.0.0.1` |
+| `WORKSPACE_MCP_ALLOW_REMOTE_BIND` | Must be exactly `true` for a non-loopback listen host |
 
 </td></tr>
 </table>
@@ -381,6 +387,8 @@ export USER_GOOGLE_EMAIL=\
 |----------|-------------|---------|
 | `WORKSPACE_MCP_BASE_URI` | Base server URI (no port) | `http://localhost` |
 | `WORKSPACE_MCP_PORT` | Server listening port | `8000` |
+| `WORKSPACE_MCP_BIND_HOST` | Server listening host | `127.0.0.1` |
+| `WORKSPACE_MCP_ALLOW_REMOTE_BIND` | Explicitly allow a non-loopback host | `false` |
 | `WORKSPACE_EXTERNAL_URL` | External URL for reverse proxy setups | None |
 | `GOOGLE_OAUTH_REDIRECT_URI` | Override OAuth callback URL | Auto-constructed |
 | `USER_GOOGLE_EMAIL` | Default auth email | None |
@@ -627,6 +635,7 @@ client_secret.json
 # Or specify custom path
 export GOOGLE_CLIENT_SECRET_PATH=\
   /path/to/secret.json
+chmod 600 /path/to/secret.json
 ```
 <sub>Traditional method</sub>
 
@@ -635,7 +644,7 @@ export GOOGLE_CLIENT_SECRET_PATH=\
 
 **⚡ .env File**
 ```bash
-cp .env.oauth21 .env
+cp .env.oauth21.example .env
 # Edit .env with credentials
 ```
 <sub>Best for development</sub>
@@ -1176,6 +1185,9 @@ credentials with support for multiple storage backends:
 - **Configurable Storage**: Environment variable `GOOGLE_MCP_CREDENTIALS_DIR` sets storage location
 - **Multi-User Support**: Store and manage credentials for multiple Google accounts
 - **Automatic Directory Creation**: Storage directory is created automatically if it doesn't exist
+- **Owner-only storage**: Managed credential/token directories are `0700`; JSON files are `0600`
+- **Crash-safe replacement**: Secret-bearing JSON is fsynced and atomically replaced, preserving the previous file if a write is interrupted
+- **Link/owner checks**: Credential and client-secret files must be regular, current-user-owned files; symbolic links are rejected
 
 **Configuration:**
 ```bash
@@ -1204,7 +1216,10 @@ creds = store.get_credential("user@example.com")
 users = store.list_users()
 ```
 
-The credential store automatically handles credential serialization, expiry parsing, and provides error handling for storage operations.
+The credential store automatically handles credential serialization, expiry parsing, private permissions,
+and atomic replacement. A file supplied through `GOOGLE_CLIENT_SECRET_PATH` must already be owned by the
+server user with mode `0600`; the server rejects a symbolic link or broader permissions rather than
+silently trusting it.
 
 ---
 
@@ -1214,7 +1229,9 @@ The credential store automatically handles credential serialization, expiry pars
 - **OAuth Callback**: Uses `http://localhost:8000/oauth2callback` for development (requires `OAUTHLIB_INSECURE_TRANSPORT=1`)
 - **Transport-Aware Callbacks**: Stdio mode starts a minimal HTTP server only for OAuth, ensuring callbacks work in all modes
 - **Production**: Use HTTPS & OAuth 2.1 and configure accordingly
-- **Network Exposure**: Consider authentication when using `mcpo` over networks
+- **Network Exposure**: Streamable HTTP listens on `127.0.0.1` by default. A non-loopback
+  `WORKSPACE_MCP_BIND_HOST` is rejected unless `WORKSPACE_MCP_ALLOW_REMOTE_BIND=true` is also set.
+- **Redirects**: Redirect URIs are exact registrations. Wildcards and cleartext external redirects are rejected; only loopback callbacks may use HTTP.
 - **Scope Minimization**: Tools request only necessary permissions
 
 ---

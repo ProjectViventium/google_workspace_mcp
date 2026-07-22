@@ -6,6 +6,8 @@ services:
       - "8000:8000"
     environment:
       - GOOGLE_MCP_CREDENTIALS_DIR=/app/store_creds
+      - WORKSPACE_MCP_BIND_HOST=0.0.0.0
+      - WORKSPACE_MCP_ALLOW_REMOTE_BIND=true
     volumes:
       - ./client_secret.json:/app/client_secret.json:ro
       - store_creds:/app/store_creds:rw

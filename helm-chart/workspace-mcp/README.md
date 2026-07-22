@@ -36,6 +36,8 @@ The following table lists the configurable parameters and their default values:
 | `singleUserMode` | Enable single-user mode | `false` |
 | `tools.enabled` | List of tools to enable | `[]` (all tools enabled) |
 | `env.MCP_ENABLE_OAUTH21` | Enable OAuth 2.1 support | `"false"` |
+| `env.WORKSPACE_MCP_BIND_HOST` | Container listen host | `"0.0.0.0"` |
+| `env.WORKSPACE_MCP_ALLOW_REMOTE_BIND` | Explicit container remote-bind opt-in | `"true"` |
 | `service.type` | Kubernetes service type | `ClusterIP` |
 | `service.port` | Service port | `8000` |
 | `ingress.enabled` | Enable ingress | `false` |
@@ -50,7 +52,7 @@ Before deploying, you need to set up Google OAuth credentials:
 1. Create a project in [Google Cloud Console](https://console.cloud.google.com/)
 2. Enable the required Google Workspace APIs
 3. Create OAuth 2.0 credentials (Web application)
-4. Set authorized redirect URI: `http://your-domain:8000/oauth2callback`
+4. Set an exact authorized redirect URI such as `https://your-domain.example/oauth2callback`
 
 ## Examples
 
@@ -133,6 +135,7 @@ The chart includes health checks that verify the application is running correctl
 - Uses read-only root filesystem where possible
 - Drops all Linux capabilities
 - Secrets are stored securely in Kubernetes secrets
+- The chart explicitly opts into its required non-loopback container bind; native installs remain loopback-only by default
 
 ## Support
 

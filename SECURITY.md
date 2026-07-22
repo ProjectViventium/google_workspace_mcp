@@ -36,6 +36,10 @@ When using this MCP server, please ensure:
 3. Use environment variables for sensitive configuration
 4. Regularly rotate OAuth refresh tokens
 5. Limit OAuth scopes to only what's necessary
+6. Keep file-based OAuth client JSON owned by the runtime user with mode `0600`; symbolic links are rejected
+7. Keep the default loopback HTTP bind. Remote binds require both an explicit
+   `WORKSPACE_MCP_BIND_HOST` and `WORKSPACE_MCP_ALLOW_REMOTE_BIND=true`, plus an authenticated TLS proxy
+8. Register every OAuth redirect URI exactly. Wildcards and non-HTTPS external redirect URIs are rejected
 
 For more information on securing your use of the project, see https://workspacemcp.com/privacy
 

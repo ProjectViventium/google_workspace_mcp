@@ -6,14 +6,25 @@ supporting multiple backends configurable via environment variables.
 """
 
 import os
-import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Optional, List
 from datetime import datetime
 from google.oauth2.credentials import Credentials
+from auth.secure_storage import (
+    StorageSecurityError,
+    atomic_write_private_json,
+    ensure_private_directory,
+    list_private_json_files,
+    read_private_json,
+    remove_private_file,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class CredentialStorageSecurityError(StorageSecurityError):
+    """Stable public error for unsafe local credential paths."""
 
 
 class CredentialStore(ABC):
@@ -100,9 +111,21 @@ class LocalDirectoryCredentialStore(CredentialStore):
 
     def _get_credential_path(self, user_email: str) -> str:
         """Get the file path for a user's credentials."""
-        if not os.path.exists(self.base_dir):
-            os.makedirs(self.base_dir)
-            logger.info(f"Created credentials directory: {self.base_dir}")
+        if (
+            not user_email
+            or user_email in {".", ".."}
+            or os.path.basename(user_email) != user_email
+            or "/" in user_email
+            or "\\" in user_email
+            or "\x00" in user_email
+        ):
+            raise CredentialStorageSecurityError(
+                f"Rejected unsafe credential identity: {user_email!r}"
+            )
+        try:
+            ensure_private_directory(self.base_dir)
+        except StorageSecurityError as exc:
+            raise CredentialStorageSecurityError(str(exc)) from exc
         return os.path.join(self.base_dir, f"{user_email}.json")
 
     def get_credential(self, user_email: str) -> Optional[Credentials]:
@@ -114,8 +137,7 @@ class LocalDirectoryCredentialStore(CredentialStore):
             return None
 
         try:
-            with open(creds_path, "r") as f:
-                creds_data = json.load(f)
+            creds_data = read_private_json(creds_path, repair_mode=True)
 
             # Parse expiry if present
             expiry = None
@@ -141,7 +163,9 @@ class LocalDirectoryCredentialStore(CredentialStore):
             logger.debug(f"Loaded credentials for {user_email} from {creds_path}")
             return credentials
 
-        except (IOError, json.JSONDecodeError, KeyError) as e:
+        except StorageSecurityError as exc:
+            raise CredentialStorageSecurityError(str(exc)) from exc
+        except (IOError, ValueError, KeyError) as e:
             logger.error(
                 f"Error loading credentials for {user_email} from {creds_path}: {e}"
             )
@@ -162,10 +186,11 @@ class LocalDirectoryCredentialStore(CredentialStore):
         }
 
         try:
-            with open(creds_path, "w") as f:
-                json.dump(creds_data, f, indent=2)
+            atomic_write_private_json(creds_path, creds_data, indent=2)
             logger.info(f"Stored credentials for {user_email} to {creds_path}")
             return True
+        except StorageSecurityError as exc:
+            raise CredentialStorageSecurityError(str(exc)) from exc
         except IOError as e:
             logger.error(
                 f"Error storing credentials for {user_email} to {creds_path}: {e}"
@@ -177,8 +202,7 @@ class LocalDirectoryCredentialStore(CredentialStore):
         creds_path = self._get_credential_path(user_email)
 
         try:
-            if os.path.exists(creds_path):
-                os.remove(creds_path)
+            if remove_private_file(creds_path):
                 logger.info(f"Deleted credentials for {user_email} from {creds_path}")
                 return True
             else:
@@ -186,6 +210,8 @@ class LocalDirectoryCredentialStore(CredentialStore):
                     f"No credential file to delete for {user_email} at {creds_path}"
                 )
                 return True  # Consider it a success if file doesn't exist
+        except StorageSecurityError as exc:
+            raise CredentialStorageSecurityError(str(exc)) from exc
         except IOError as e:
             logger.error(
                 f"Error deleting credentials for {user_email} from {creds_path}: {e}"
@@ -194,18 +220,17 @@ class LocalDirectoryCredentialStore(CredentialStore):
 
     def list_users(self) -> List[str]:
         """List all users with credential files."""
-        if not os.path.exists(self.base_dir):
-            return []
-
         users = []
         try:
-            for filename in os.listdir(self.base_dir):
-                if filename.endswith(".json"):
-                    user_email = filename[:-5]  # Remove .json extension
-                    users.append(user_email)
+            for credential_path in list_private_json_files(
+                self.base_dir, repair_mode=True
+            ):
+                users.append(credential_path.stem)
             logger.debug(
                 f"Found {len(users)} users with credentials in {self.base_dir}"
             )
+        except StorageSecurityError as exc:
+            raise CredentialStorageSecurityError(str(exc)) from exc
         except OSError as e:
             logger.error(f"Error listing credential files in {self.base_dir}: {e}")
 
