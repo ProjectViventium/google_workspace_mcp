@@ -6,7 +6,11 @@ from importlib import metadata, import_module
 from dotenv import load_dotenv
 
 from auth.oauth_config import reload_oauth_config, is_stateless_mode
-from core.log_formatter import EnhancedLogFormatter, configure_file_logging
+from core.log_formatter import (
+    EnhancedLogFormatter,
+    configure_file_logging,
+    configure_sensitive_dependency_logging,
+)
 from core.utils import check_credentials_directory_permissions
 from core.server import server, set_transport_mode, configure_server_for_http
 from core.config import resolve_http_bind_host
@@ -25,6 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+configure_sensitive_dependency_logging()
 logger = logging.getLogger(__name__)
 
 configure_file_logging()
