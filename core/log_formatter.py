@@ -143,6 +143,12 @@ def setup_enhanced_logging(log_level: int = logging.INFO, use_colors: bool = Tru
         root_logger.addHandler(console_handler)
 
 
+def configure_sensitive_dependency_logging() -> None:
+    """Keep HTTP dependency logs from persisting credential-bearing request URLs."""
+    for logger_name in ("httpx", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
 def configure_file_logging(logger_name: str = None) -> bool:
     """
     Configure file logging based on stateless mode setting.
