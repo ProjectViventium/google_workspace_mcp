@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from email.header import Header
+
 import pytest
 
 from gmail.gmail_tools import draft_gmail_message
@@ -153,3 +155,41 @@ async def test_draft_result_preserves_created_identity_when_verification_is_unav
     assert "Draft ID: draft-1" in result
     assert "Do not create a replacement draft automatically." in result
     assert "synthetic lookup failure" not in result
+
+
+@pytest.mark.asyncio
+async def test_draft_verification_decodes_rfc2047_subject_and_recipient_headers():
+    subject = "Café planning — next steps"
+    recipient = "Zoë Example <zoe@example.com>"
+    drafts = _Drafts(
+        persisted={
+            "id": "draft-1",
+            "message": {
+                "id": "message-1",
+                "labelIds": ["DRAFT"],
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": Header(subject, "utf-8").encode()},
+                        {"name": "To", "value": Header(recipient, "utf-8").encode()},
+                    ]
+                },
+            },
+        }
+    )
+
+    result = await _raw_draft_tool()(
+        _GmailService(drafts),
+        "owner@example.com",
+        subject=subject,
+        body="Synthetic body",
+        to=recipient,
+        cc=None,
+        bcc=None,
+        thread_id=None,
+        in_reply_to=None,
+        references=None,
+    )
+
+    assert "Draft created and verified unsent." in result
+    assert f"Subject: {subject}" in result
+    assert f"To: {recipient}" in result

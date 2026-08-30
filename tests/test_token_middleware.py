@@ -114,3 +114,52 @@ def test_token_middleware_diagnostics_never_log_code_or_client(caplog):
     assert "private-code-value" not in caplog.text
     assert "private-client-value" not in caplog.text
     assert "private-verifier" not in caplog.text
+
+
+def test_token_middleware_handles_non_object_json_error_body(caplog):
+    async def rejecting_app(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 400, "headers": []})
+        await send(
+            {
+                "type": "http.response.body",
+                "body": b'[{"error":"must-not-be-read"}]',
+                "more_body": False,
+            }
+        )
+
+    middleware = TokenClientIdFixMiddleware(rejecting_app)
+    delivered = False
+    sent = []
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        delivered = True
+        return {
+            "type": "http.request",
+            "body": b"grant_type=authorization_code&code=opaque&client_id=client",
+            "more_body": False,
+        }
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "path": "/token",
+        "method": "POST",
+        "headers": [],
+    }
+
+    with caplog.at_level(logging.WARNING, logger="core.server"):
+        asyncio.run(middleware(scope, receive, send))
+
+    assert [message["type"] for message in sent] == [
+        "http.response.start",
+        "http.response.body",
+    ]
+    assert "oauth_token_exchange_failed" in caplog.text
+    assert "error=unknown" in caplog.text
+    assert "must-not-be-read" not in caplog.text

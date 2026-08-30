@@ -174,6 +174,8 @@ class TokenClientIdFixMiddleware:
                         payload = json.loads(response_body.decode("utf-8"))
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
                     error = self._safe_error_value(payload.get("error"), limit=64)
                     description = self._safe_error_value(
                         payload.get("error_description"), limit=160

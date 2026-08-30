@@ -10,6 +10,8 @@ import base64
 import ssl
 from typing import Optional, List, Dict, Literal
 
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.mime.text import MIMEText
 
 from fastapi import Body
@@ -163,6 +165,15 @@ def _composed_gmail_subject(subject: str, in_reply_to: Optional[str]) -> str:
     if in_reply_to and not subject.lower().startswith("re:"):
         return f"Re: {subject}"
     return subject
+
+
+def _decoded_gmail_header(value: str) -> str:
+    """Decode a Gmail metadata header before comparing it with user input."""
+    try:
+        decoded = str(make_header(decode_header(value)))
+    except (HeaderParseError, LookupError, UnicodeError):
+        return value
+    return " ".join(part.strip() for part in decoded.splitlines())
 
 
 def _prepare_gmail_message(
@@ -811,8 +822,8 @@ async def draft_gmail_message(
         for item in (persisted_message.get("payload") or {}).get("headers", [])
         if isinstance(item, dict)
     }
-    persisted_subject = headers.get("subject", "")
-    persisted_to = headers.get("to", "")
+    persisted_subject = _decoded_gmail_header(headers.get("subject", ""))
+    persisted_to = _decoded_gmail_header(headers.get("to", ""))
     labels = {str(label).upper() for label in persisted_message.get("labelIds", [])}
 
     matches_request = (
