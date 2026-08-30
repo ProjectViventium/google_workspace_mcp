@@ -173,7 +173,10 @@ def _decoded_gmail_header(value: str) -> str:
         decoded = str(make_header(decode_header(value)))
     except (HeaderParseError, LookupError, UnicodeError):
         return value
-    return " ".join(part.strip() for part in decoded.splitlines())
+    lines = decoded.splitlines()
+    if not lines:
+        return decoded
+    return lines[0] + "".join(" " + line.lstrip(" \t") for line in lines[1:])
 
 
 def _prepare_gmail_message(

@@ -193,3 +193,37 @@ async def test_draft_verification_decodes_rfc2047_subject_and_recipient_headers(
     assert "Draft created and verified unsent." in result
     assert f"Subject: {subject}" in result
     assert f"To: {recipient}" in result
+
+
+@pytest.mark.asyncio
+async def test_draft_verification_preserves_trailing_header_whitespace():
+    subject = "Example subject "
+    drafts = _Drafts(
+        persisted={
+            "id": "draft-1",
+            "message": {
+                "id": "message-1",
+                "labelIds": ["DRAFT"],
+                "payload": {
+                    "headers": [
+                        {"name": "Subject", "value": subject},
+                    ]
+                },
+            },
+        }
+    )
+
+    result = await _raw_draft_tool()(
+        _GmailService(drafts),
+        "owner@example.com",
+        subject=subject,
+        body="Synthetic body",
+        to=None,
+        cc=None,
+        bcc=None,
+        thread_id=None,
+        in_reply_to=None,
+        references=None,
+    )
+
+    assert "Draft created and verified unsent." in result
