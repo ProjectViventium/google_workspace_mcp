@@ -1,4 +1,6 @@
+import json
 import logging
+import re
 from typing import List, Optional
 from importlib import metadata
 
@@ -43,6 +45,15 @@ class TokenClientIdFixMiddleware:
     """
     def __init__(self, app):
         self.app = app
+
+    @staticmethod
+    def _safe_error_value(value, *, limit):
+        if not isinstance(value, str):
+            return "unknown"
+        normalized = " ".join(value.split())
+        if not normalized or not re.fullmatch(r"[A-Za-z0-9_. -]+", normalized):
+            return "unknown"
+        return normalized[:limit]
     
     async def __call__(self, scope, receive, send):
         from urllib.parse import parse_qs, urlencode
@@ -63,6 +74,23 @@ class TokenClientIdFixMiddleware:
             form_data = parse_qs(body_str)
             
             logger.info(f"[TokenFix] Original fields: {list(form_data.keys())}")
+
+            code = form_data.get('code', [''])[0]
+            requested_client_id = form_data.get('client_id', [''])[0]
+            code_data = (
+                _auth_provider._client_codes.get(code)
+                if code and _auth_provider is not None
+                else None
+            )
+            logger.info(
+                "[TokenFix] Authorization code registered=%s client_match=%s",
+                code_data is not None,
+                bool(
+                    code_data is not None
+                    and requested_client_id
+                    and code_data.get('client_id') == requested_client_id
+                ),
+            )
             
             # Get config for fallback values
             from auth.oauth_config import get_oauth_config
@@ -73,7 +101,6 @@ class TokenClientIdFixMiddleware:
                 logger.info("[TokenFix] client_id is missing")
                 
                 # Try to get client_id from code data
-                code = form_data.get('code', [''])[0]
                 client_id_added = False
                 
                 if code and _auth_provider:
@@ -119,7 +146,46 @@ class TokenClientIdFixMiddleware:
                     return {"type": "http.request", "body": body, "more_body": False}
                 return {"type": "http.request", "body": b"", "more_body": False}
             
-            await self.app(new_scope, new_receive, send)
+            response_status = None
+            response_body = bytearray()
+
+            async def inspected_send(message):
+                nonlocal response_status
+                if message.get("type") == "http.response.start":
+                    response_status = message.get("status")
+                elif (
+                    message.get("type") == "http.response.body"
+                    and isinstance(response_status, int)
+                    and response_status >= 400
+                    and len(response_body) < 4096
+                ):
+                    remaining = 4096 - len(response_body)
+                    response_body.extend(message.get("body", b"")[:remaining])
+
+                await send(message)
+
+                if (
+                    message.get("type") == "http.response.body"
+                    and not message.get("more_body", False)
+                    and isinstance(response_status, int)
+                    and response_status >= 400
+                ):
+                    try:
+                        payload = json.loads(response_body.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        payload = {}
+                    error = self._safe_error_value(payload.get("error"), limit=64)
+                    description = self._safe_error_value(
+                        payload.get("error_description"), limit=160
+                    )
+                    logger.warning(
+                        "oauth_token_exchange_failed status=%s error=%s description=%s",
+                        response_status,
+                        error,
+                        description,
+                    )
+
+            await self.app(new_scope, new_receive, inspected_send)
         else:
             await self.app(scope, receive, send)
 
@@ -490,7 +556,14 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
         logger.error(f"Error processing OAuth callback: {str(e)}", exc_info=True)
         return create_server_error_response(str(e))
 
-@server.tool()
+@server.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+)
 async def start_google_auth(service_name: str, user_google_email: str = USER_GOOGLE_EMAIL) -> str:
     """
     Manually initiate Google OAuth authentication flow.

@@ -31,6 +31,25 @@ GMAIL_BATCH_SIZE = 25
 GMAIL_REQUEST_DELAY = 0.1
 HTML_BODY_TRUNCATE_LIMIT = 20000
 
+READ_ONLY_TOOL_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+EXTERNAL_WRITE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+REVERSIBLE_WRITE_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+}
+
 
 def _extract_message_body(payload):
     """
@@ -139,6 +158,13 @@ def _extract_headers(payload: dict, header_names: List[str]) -> Dict[str, str]:
     return headers
 
 
+def _composed_gmail_subject(subject: str, in_reply_to: Optional[str]) -> str:
+    """Return the exact subject written to the MIME message."""
+    if in_reply_to and not subject.lower().startswith("re:"):
+        return f"Re: {subject}"
+    return subject
+
+
 def _prepare_gmail_message(
     subject: str,
     body: str,
@@ -168,9 +194,7 @@ def _prepare_gmail_message(
         Tuple of (raw_message, thread_id) where raw_message is base64 encoded
     """
     # Handle reply subject formatting
-    reply_subject = subject
-    if in_reply_to and not subject.lower().startswith('re:'):
-        reply_subject = f"Re: {subject}"
+    reply_subject = _composed_gmail_subject(subject, in_reply_to)
 
     # Prepare the email
     normalized_format = body_format.lower()
@@ -279,7 +303,7 @@ def _format_gmail_results_plain(messages: list, query: str) -> str:
     return "\n".join(lines)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @handle_http_errors("search_gmail_messages", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
 async def search_gmail_messages(
@@ -324,7 +348,7 @@ async def search_gmail_messages(
     return formatted_output
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @handle_http_errors("get_gmail_message_content", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
 async def get_gmail_message_content(
@@ -397,7 +421,7 @@ async def get_gmail_message_content(
     return content_text
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @handle_http_errors("get_gmail_messages_content_batch", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
 async def get_gmail_messages_content_batch(
@@ -571,7 +595,7 @@ async def get_gmail_messages_content_batch(
     return final_output
 
 
-@server.tool()
+@server.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
 @handle_http_errors("send_gmail_message", service_type="gmail")
 @require_google_service("gmail", GMAIL_SEND_SCOPE)
 async def send_gmail_message(
@@ -669,7 +693,7 @@ async def send_gmail_message(
     return f"Email sent! Message ID: {message_id}"
 
 
-@server.tool()
+@server.tool(annotations=REVERSIBLE_WRITE_TOOL_ANNOTATIONS)
 @handle_http_errors("draft_gmail_message", service_type="gmail")
 @require_google_service("gmail", GMAIL_COMPOSE_SCOPE)
 async def draft_gmail_message(
@@ -729,6 +753,7 @@ async def draft_gmail_message(
     )
 
     # Prepare the email message
+    expected_subject = _composed_gmail_subject(subject, in_reply_to)
     raw_message, thread_id_final = _prepare_gmail_message(
         subject=subject,
         body=body,
@@ -752,7 +777,69 @@ async def draft_gmail_message(
         service.users().drafts().create(userId="me", body=draft_body).execute
     )
     draft_id = created_draft.get("id")
-    return f"Draft created! Draft ID: {draft_id}"
+    message_id = (created_draft.get("message") or {}).get("id") or ""
+
+    # A successful write is not enough evidence for a worker to claim that the
+    # requested recipient, subject, and thread were persisted. Read the draft
+    # back once and return only the small metadata needed to verify the write.
+    # If that read fails, preserve the created draft identity and explicitly
+    # warn callers not to retry the external write automatically.
+    try:
+        persisted_draft = await asyncio.to_thread(
+            service.users()
+            .drafts()
+            .get(userId="me", id=draft_id, format="metadata")
+            .execute
+        )
+    except Exception as exc:
+        logger.warning(
+            "[draft_gmail_message] Draft created but verification was unavailable (%s)",
+            type(exc).__name__,
+        )
+        return (
+            "Draft created; verification unavailable.\n"
+            f"Draft ID: {draft_id}\n"
+            f"Message ID: {message_id or '(unavailable)'}\n"
+            "Do not create a replacement draft automatically."
+        )
+
+    persisted_message = persisted_draft.get("message") or {}
+    message_id = persisted_message.get("id") or message_id
+    persisted_thread_id = persisted_message.get("threadId") or ""
+    headers = {
+        str(item.get("name", "")).lower(): str(item.get("value", ""))
+        for item in (persisted_message.get("payload") or {}).get("headers", [])
+        if isinstance(item, dict)
+    }
+    persisted_subject = headers.get("subject", "")
+    persisted_to = headers.get("to", "")
+    labels = {str(label).upper() for label in persisted_message.get("labelIds", [])}
+
+    matches_request = (
+        "DRAFT" in labels
+        and persisted_subject == expected_subject
+        and (not to or persisted_to == to)
+        and (not thread_id_final or persisted_thread_id == thread_id_final)
+    )
+    if not matches_request:
+        return (
+            "Draft created, but persisted metadata did not match the requested fields.\n"
+            f"Draft ID: {draft_id}\n"
+            f"Message ID: {message_id or '(unavailable)'}\n"
+            f"Thread ID: {persisted_thread_id or '(unavailable)'}\n"
+            f"Subject: {persisted_subject or '(empty)'}\n"
+            f"To: {persisted_to or '(empty)'}\n"
+            "Do not create a replacement draft automatically."
+        )
+
+    return (
+        "Draft created and verified unsent.\n"
+        f"Draft ID: {draft_id}\n"
+        f"Message ID: {message_id}\n"
+        f"Thread ID: {persisted_thread_id}\n"
+        f"Subject: {persisted_subject}\n"
+        f"To: {persisted_to or '(empty)'}"
+    )
 
 
 def _format_thread_content(thread_data: dict, thread_id: str) -> str:
@@ -830,7 +917,7 @@ def _format_thread_content(thread_data: dict, thread_id: str) -> str:
     return "\n".join(content_lines)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @require_google_service("gmail", "gmail_read")
 @handle_http_errors("get_gmail_thread_content", is_read_only=True, service_type="gmail")
 async def get_gmail_thread_content(
@@ -858,7 +945,7 @@ async def get_gmail_thread_content(
     return _format_thread_content(thread_response, thread_id)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @require_google_service("gmail", "gmail_read")
 @handle_http_errors("get_gmail_threads_content_batch", is_read_only=True, service_type="gmail")
 async def get_gmail_threads_content_batch(
@@ -965,7 +1052,7 @@ async def get_gmail_threads_content_batch(
     return header + "\n\n" + "\n---\n\n".join(output_threads)
 
 
-@server.tool()
+@server.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 @handle_http_errors("list_gmail_labels", is_read_only=True, service_type="gmail")
 @require_google_service("gmail", "gmail_read")
 async def list_gmail_labels(service, user_google_email: str) -> str:
@@ -1013,7 +1100,7 @@ async def list_gmail_labels(service, user_google_email: str) -> str:
     return "\n".join(lines)
 
 
-@server.tool()
+@server.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
 @handle_http_errors("manage_gmail_label", service_type="gmail")
 @require_google_service("gmail", GMAIL_LABELS_SCOPE)
 async def manage_gmail_label(
@@ -1092,7 +1179,7 @@ async def manage_gmail_label(
         return f"Label '{label_name}' (ID: {label_id}) deleted successfully!"
 
 
-@server.tool()
+@server.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
 @handle_http_errors("modify_gmail_message_labels", service_type="gmail")
 @require_google_service("gmail", GMAIL_MODIFY_SCOPE)
 async def modify_gmail_message_labels(
@@ -1144,7 +1231,7 @@ async def modify_gmail_message_labels(
     return f"Message labels updated successfully!\nMessage ID: {message_id}\n{'; '.join(actions)}"
 
 
-@server.tool()
+@server.tool(annotations=EXTERNAL_WRITE_TOOL_ANNOTATIONS)
 @handle_http_errors("batch_modify_gmail_message_labels", service_type="gmail")
 @require_google_service("gmail", GMAIL_MODIFY_SCOPE)
 async def batch_modify_gmail_message_labels(
