@@ -53,6 +53,8 @@ dist/
 .DS_Store
 client_secret.json
 mcp_server_debug.log
+*.log
+/logs/
 /.credentials
 /.claude
 .mcp.json
